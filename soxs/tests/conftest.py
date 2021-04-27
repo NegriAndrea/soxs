@@ -1,4 +1,5 @@
 import pytest
+import os
 
 
 def pytest_addoption(parser):
@@ -15,4 +16,7 @@ def answer_store(request):
 
 @pytest.fixture()
 def answer_dir(request):
-    return request.config.getoption('--answer_dir')
+    ad = os.path.abspath(request.config.getoption('--answer_dir'))
+    if not os.path.exists(ad):
+        os.makedirs(ad)
+    return ad

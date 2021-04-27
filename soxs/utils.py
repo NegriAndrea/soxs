@@ -6,10 +6,12 @@ import astropy.units as u
 from astropy.units import Quantity
 import warnings
 from configparser import ConfigParser
+import regions
+import appdirs
 
 # Configuration
 
-soxs_cfg_defaults = {"response_path": "/does/not/exist",
+soxs_cfg_defaults = {"soxs_data_dir": "/does/not/exist",
                      "abund_table": "angr"}
 
 CONFIG_DIR = os.environ.get('XDG_CONFIG_HOME',
@@ -57,11 +59,24 @@ mylog = soxsLogger
 
 mylog.setLevel('INFO')
 
+if soxs_cfg.has_option("soxs", "response_path"):
+    mylog.warning("The 'response_path' option in the SOXS configuration "
+                  "is deprecated and has been replaced with 'soxs_data_dir'. "
+                  "Please update your configuration accordingly.")
+    soxs_cfg.set("soxs", "soxs_data_dir", soxs_cfg.get("soxs", "response_path"))
+
+if soxs_cfg.get("soxs", "soxs_data_dir") == "/does/not/exist":
+    soxs_data_dir = appdirs.user_cache_dir("soxs")
+    mylog.warning(f"Setting 'soxs_data_dir' to {soxs_data_dir} for this session. "
+                  f"Please update your configuration if you want it somewhere else.")
+    soxs_cfg.set("soxs", "soxs_data_dir", appdirs.user_cache_dir("soxs"))
+
 
 def issue_deprecation_warning(msg):
     import warnings
     from numpy import VisibleDeprecationWarning
     warnings.warn(msg, VisibleDeprecationWarning, stacklevel=3)
+
 
 soxs_path = os.path.abspath(os.path.dirname(__file__))
 soxs_files_path = os.path.join(soxs_path, "files")
@@ -178,3 +193,107 @@ class DummyPbar(object):
 
     def close(self):
         pass
+
+
+def create_region(rtype, args, dx, dy):
+    if rtype in ["Rectangle", "Box"]:
+        xctr, yctr, xw, yw = args
+        x = xctr+dx
+        y = yctr+dy
+        center = regions.PixCoord(x=x, y=y)
+        reg = regions.RectanglePixelRegion(center=center, width=xw, height=yw)
+        bounds = [x-0.5*xw, x+0.5*xw, y-0.5*yw, y+0.5*yw]
+    elif rtype == "Circle":
+        xctr, yctr, radius = args
+        x = xctr+dx
+        y = yctr+dy
+        center = regions.PixCoord(x=x, y=y)
+        reg = regions.CirclePixelRegion(center=center, radius=radius)
+        bounds = [x-radius, x+radius, y-radius, y+radius]
+    elif rtype == "Polygon":
+        x = np.array(args[0])+dx
+        y = np.array(args[1])+dy
+        vertices = regions.PixCoord(x=x, y=y)
+        reg = regions.PolygonPixelRegion(vertices=vertices)
+        bounds = [x.min(), x.max(), y.min(), y.max()]
+    else:
+        raise NotImplementedError
+    return reg, bounds
+
+
+def process_fits_string(fitsstr):
+    import re
+    import astropy.io.fits as pyfits
+    fn = fitsstr.split("[")[0]
+    brackets = re.findall(r"[^[]*\[([^]]*)\]", fitsstr)
+    with pyfits.open(fn) as f:
+        if len(brackets) == 0:
+            imgs = np.array([hdu.is_image for hdu in f])
+            if imgs.sum() > 1:
+                raise IOError("Multiple HDUs in this file, "
+                              "please specify one to read!")
+            ext = np.where(imgs)[0][0]
+        else:
+            ext = brackets[0]
+            if ext.isdigit():
+                ext = int(ext)
+        imhdu = f[ext]
+    return imhdu
+
+
+class PoochHandle:
+    r"""
+    Container for a pooch object used to fetch remote response that isn't
+    already stored locally.
+    """
+    def __init__(self, cache_dir=None):
+        import json
+        import pooch
+        import pkg_resources
+        if cache_dir is None:
+            if os.path.isdir(soxs_cfg.get("soxs", "soxs_data_dir")):
+                cache_dir = soxs_cfg.get("soxs", "soxs_data_dir")
+            else:
+                cache_dir = pooch.os_cache("soxs")
+                
+        self._registry = json.load(
+            pkg_resources.resource_stream("soxs", "file_hash_registry.json"))
+        self.pooch_obj = pooch.create(
+            path=cache_dir,
+            registry=self._registry,
+            env="SOXS_DATA_DIR",
+            base_url="https://hea-www.cfa.harvard.edu/soxs/soxs_responses/"
+        )
+        self.dl = pooch.HTTPDownloader(progressbar=True)
+
+    def fetch(self, fname):
+        return self.pooch_obj.fetch(fname, downloader=self.dl)
+
+
+finley = PoochHandle()
+
+
+def get_data_file(fn):
+    soxs_data_dir = soxs_cfg.get("soxs", "soxs_data_dir")
+    rel_fn = os.path.split(fn)[-1]
+    data_fn = os.path.join(soxs_data_dir, rel_fn)
+    if os.path.exists(fn):
+        return fn
+    elif os.path.exists(data_fn):
+        return data_fn
+    else:
+        return finley.fetch(rel_fn)
+
+
+def image_pos(im, nph, prng):
+    im[im < 0.0] = 0.0
+    im = im.T/im.sum()
+    idxs = prng.choice(im.size, size=nph, p=im.flatten())
+    x, y = np.unravel_index(idxs, im.shape)
+    dx = prng.uniform(low=0.5, high=1.5, size=x.size)
+    dy = prng.uniform(low=0.5, high=1.5, size=y.size)
+    return x+dx, y+dy
+
+
+def find_nearest(a, b):
+    return np.argmin(np.abs(a[:, np.newaxis] - b), axis=0)

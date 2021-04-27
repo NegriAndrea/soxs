@@ -1,10 +1,44 @@
 import astropy.io.fits as pyfits
 import numpy as np
-import os
 from soxs.utils import parse_prng, parse_value, \
-    ensure_list, mylog
+    ensure_numpy_array, mylog, process_fits_string
 from soxs.spatial import construct_wcs
 from astropy.units import Quantity
+from collections.abc import Sequence
+import os
+
+
+def _parse_catalog_entry(src):
+    import re
+    brackets = re.findall(r"[^[]*\[([^]]*)\]", src)
+    src_file = src.split("[")[0]
+    ext = brackets[0].lower().split(",")
+    extname = ext[0]
+    if len(ext) == 2:
+        extver = int(ext[1])
+    else:
+        extver = None
+    if len(brackets) == 2 and extname == "spectrum":
+        rowstr = brackets[1].lower()
+        row = rowstr.split("==")[1].strip("'")
+        if "row" in rowstr:
+            row = int(row)
+    else:
+        row = None
+    return src_file, extname, extver, row
+
+
+class LazyReadSimputCatalog(Sequence):
+    def __init__(self, src_cat):
+        self.src_cat = src_cat
+
+    def __getitem__(self, i):
+        spec = self.src_cat.spectra[i]
+        return self.src_cat.read_source(spec)
+
+    def __len__(self):
+        return self.src_cat.num_sources
+
 
 def read_simput_catalog(simput_file):
     r"""
@@ -22,297 +56,430 @@ def read_simput_catalog(simput_file):
        and energies of the events from the sources.
     2. NumPy arrays of the parameters of the sources.
     """
-    events = []
-    parameters = {}
-    simput_dir = os.path.split(os.path.abspath(simput_file))[0]
-    f_simput = pyfits.open(simput_file)
-    parameters["flux"] = f_simput["src_cat"].data["flux"]
-    parameters["emin"] = f_simput["src_cat"].data["e_min"]
-    parameters["emax"] = f_simput["src_cat"].data["e_max"]
-    parameters["sources"] = f_simput["src_cat"].data["src_name"]
-    phlist_files = [file.split("[")[0] for file in 
-                    f_simput["src_cat"].data["spectrum"]]
-    f_simput.close()
-    for phlist_file in phlist_files:
-        f_phlist = pyfits.open(os.path.join(simput_dir, phlist_file))
-        evt = {}
-        for key in ["ra", "dec", "energy"]:
-            evt[key] = f_phlist["phlist"].data[key]
-        f_phlist.close()
-        events.append(evt)
-    return events, parameters
+    sc = SimputCatalog.from_file(simput_file)
+    parameters = {"emin": sc.emin,
+                  "emax": sc.emax,
+                  "src_names": sc.src_names,
+                  "flux": sc.fluxes}
+    return LazyReadSimputCatalog(sc), parameters
 
-def handle_simput_catalog(simput_prefix, phfiles, flux, emin, emax, 
-                          src_names, append, overwrite):
 
-    simputfile = simput_prefix+"_simput.fits"
+class SimputCatalog:
 
-    num_new_sources = len(phfiles)
-
-    if append:
-        f = pyfits.open(simputfile)
-        num_sources = f["SRC_CAT"].data["SRC_ID"].size
-        spec_files = f["SRC_CAT"].data["SPECTRUM"][:]
-        img_files = f["SRC_CAT"].data["IMAGE"][:]
-        names = []
-        ph_exts = []
-        for i, phfile in enumerate(phfiles):
-            id = num_sources + 1 + i
-            ph_ext = phfile + "[PHLIST,1]"
-            if ph_ext in spec_files or ph_ext in img_files:
-                raise IOError("This SIMPUT catalog already has an entry for file %s!" % phfile)
-            ph_exts.append(ph_ext)
-            if src_names[i] is None:
-                names.append("soxs_src_%d" % id)
-            else:
-                names.append(src_names[i])
-        src_id = np.concatenate([f["SRC_CAT"].data["SRC_ID"][:], 
-                                 np.arange(num_new_sources)+num_sources+1])
-        spectrum = np.concatenate([spec_files, ph_exts])
-        image = np.concatenate([img_files, ph_exts])
-        ra = np.concatenate([f["SRC_CAT"].data["RA"][:], np.zeros(num_new_sources)])
-        dec = np.concatenate([f["SRC_CAT"].data["DEC"][:], np.zeros(num_new_sources)])
-        e_min = np.concatenate([f["SRC_CAT"].data["E_MIN"][:], emin])
-        e_max = np.concatenate([f["SRC_CAT"].data["E_MAX"][:], emax])
-        flx = np.concatenate([f["SRC_CAT"].data["FLUX"][:], flux])
-        src_name = np.concatenate([f["SRC_CAT"].data["SRC_NAME"][:], names])
-        f.close()
-    else:
-        src_id = np.arange(num_new_sources).astype("int32")+1
-        ra = np.array([0.0]*num_new_sources)
-        dec = np.array([0.0]*num_new_sources)
-        e_min = np.array([emin]*num_new_sources)
-        e_max = np.array([emax]*num_new_sources)
-        flx = np.array([flux]*num_new_sources)
-        spectrum = np.array([phfile + "[PHLIST,1]" for phfile in phfiles])
-        image = spectrum
-        names = []
-        for i, src_name in enumerate(src_names):
-            if src_name is None:
-                names.append("soxs_src_%d" % (i+1))
-            else:
-                names.append(src_name)
-        src_name = np.array(names)
-
-    col1 = pyfits.Column(name='SRC_ID', format='J', array=src_id)
-    col2 = pyfits.Column(name='RA', format='D', array=ra)
-    col3 = pyfits.Column(name='DEC', format='D', array=dec)
-    col4 = pyfits.Column(name='E_MIN', format='D', array=e_min)
-    col5 = pyfits.Column(name='E_MAX', format='D', array=e_max)
-    col6 = pyfits.Column(name='FLUX', format='D', array=flx)
-    col7 = pyfits.Column(name='SPECTRUM', format='80A', array=spectrum)
-    col8 = pyfits.Column(name='IMAGE', format='80A', array=image)
-    col9 = pyfits.Column(name='SRC_NAME', format='80A', array=src_name)
-
-    coldefs = pyfits.ColDefs([col1, col2, col3, col4, col5, col6, col7, col8, col9])
-
-    wrhdu = pyfits.BinTableHDU.from_columns(coldefs)
-    wrhdu.name = "SRC_CAT"
-
-    wrhdu.header["HDUCLASS"] = "HEASARC"
-    wrhdu.header["HDUCLAS1"] = "SIMPUT"
-    wrhdu.header["HDUCLAS2"] = "SRC_CAT"
-    wrhdu.header["HDUVERS"] = "1.1.0"
-    wrhdu.header["RADECSYS"] = "FK5"
-    wrhdu.header["EQUINOX"] = 2000.0
-    wrhdu.header["TUNIT2"] = "deg"
-    wrhdu.header["TUNIT3"] = "deg"
-    wrhdu.header["TUNIT4"] = "keV"
-    wrhdu.header["TUNIT5"] = "keV"
-    wrhdu.header["TUNIT6"] = "erg/s/cm**2"
-
-    wrhdu.writeto(simputfile, overwrite=(overwrite or append))
-
-def write_photon_list(simput_prefix, phlist_prefix, flux, ra, dec, energy,
-                      append=False, overwrite=False):
-    r"""
-    Write events to a new SIMPUT photon list. It can be 
-    associated with a new or existing SIMPUT catalog. 
-
-    Parameters
-    ----------
-    simput_prefix : string
-        The filename prefix for the SIMPUT file.
-    phlist_prefix : string
-        The filename prefix for the photon list file.
-    flux : float
-        The energy flux of all the photons, in units of 
-        erg/cm**2/s.
-    ra : NumPy array
-        The right ascension of the photons, in degrees.
-    dec : NumPy array
-        The declination of the photons, in degrees.
-    energy : NumPy array or array-like thing
-        The energy of the photons, in keV.
-    append : boolean, optional
-        If True, append a new source an existing SIMPUT 
-        catalog. Default: False
-    overwrite : boolean, optional
-        Set to True to overwrite previous files. Default: False
-    """
-    # Make sure these are arrays
-    energy = np.asarray(energy)
-    ra = np.asarray(ra)
-    dec = np.asarray(dec)
-    if hasattr(flux, "value"):
-        flux = flux.value
-
-    emin = energy.min()
-    emax = energy.max()
-
-    col1 = pyfits.Column(name='ENERGY', format='E', array=energy)
-    col2 = pyfits.Column(name='RA', format='D', array=ra)
-    col3 = pyfits.Column(name='DEC', format='D', array=dec)
-    cols = [col1, col2, col3]
-
-    coldefs = pyfits.ColDefs(cols)
-
-    tbhdu = pyfits.BinTableHDU.from_columns(coldefs)
-    tbhdu.name = "PHLIST"
-
-    tbhdu.header["HDUCLASS"] = "HEASARC/SIMPUT"
-    tbhdu.header["HDUCLAS1"] = "PHOTONS"
-    tbhdu.header["HDUVERS"] = "1.1.0"
-    tbhdu.header["EXTVER"] = 1
-    tbhdu.header["REFRA"] = 0.0
-    tbhdu.header["REFDEC"] = 0.0
-    tbhdu.header["TUNIT1"] = "keV"
-    tbhdu.header["TUNIT2"] = "deg"
-    tbhdu.header["TUNIT3"] = "deg"
-
-    phfile = phlist_prefix+"_phlist.fits"
-
-    tbhdu.writeto(phfile, overwrite=overwrite)
-
-    handle_simput_catalog(simput_prefix, [phfile], [flux], [emin], 
-                          [emax], [phlist_prefix], append, overwrite)
-
-class SimputCatalog(object):
+    def __init__(self, spectra, images, src_names, ra, dec, fluxes,
+                 emin, emax, filename):
+        self.spectra = ensure_numpy_array(spectra)
+        self.images = ensure_numpy_array(images)
+        self.src_names = ensure_numpy_array(src_names)
+        self.ra = ensure_numpy_array(ra)
+        self.dec = ensure_numpy_array(dec)
+        self.fluxes = ensure_numpy_array(fluxes)
+        self.emin = ensure_numpy_array(emin)
+        self.emax = ensure_numpy_array(emax)
+        self.filename = filename
+        self.num_sources = self.spectra.size
+        # timing not yet supported
+        self.timing = np.array(["NULL"]*self.num_sources)
 
     @classmethod
-    def from_models(cls, name, phlist_name, spectral_model, spatial_model,
-                    t_exp, area, prng=None):
+    def from_source(cls, filename, source, src_filename=None,
+                    overwrite=False):
         """
-        Generate a SIMPUT catalog object and a single photon list
-        from a spectral and a spatial model. 
+        Create a new :class:`~soxs.simput.SimputCatalog`
+        instance using a single :class:`~soxs.simput.SimputSource`
+        instance.
+
+        Parameters
+        ----------
+        filename : string
+            The name of the SIMPUT catalog file to write. The
+            file will be written 
+        source : :class:`~soxs.simput.SimputSource`
+            The SIMPUT source to create the catalog with.
+        src_filename : string, optional
+            If set, this will be the filename to write the source
+            to. By default, the source will be written to the same
+            file as the SIMPUT catalog.
+        overwrite : boolean, optional
+            Whether or not to overwrite an existing file with
+            the same name. If src_filename=None and the source is
+            to the written to the SIMPUT catalog file, then this
+            argument is ignored. If src_filename is another value,
+            it exists, and overwrite=False, the source will be
+            appended to the file. Default: False
+
+        """
+        sc = cls([], [], [], [], [], [], [], [], filename)
+        if os.path.exists(filename) and not overwrite:
+            raise IOError(f"{filename} exists and overwrite=False!")
+        sc._write_catalog(overwrite=overwrite)
+        sc.append(source, src_filename=src_filename,
+                  overwrite=overwrite)
+        return sc
+
+    @classmethod
+    def from_file(cls, filename):
+        """
+        Generate a SIMPUT catalog object by reading it in from
+        disk.
+
+        Parameters
+        ----------
+        filename : string
+            The name of the SIMPUT catalog file to read the
+            catalog and photon lists from.
+        """
+        f_simput = pyfits.open(filename)
+        fluxes = f_simput["src_cat"].data["flux"]
+        src_names = f_simput["src_cat"].data["src_name"]
+        e_min = f_simput["src_cat"].data["e_min"]
+        e_max = f_simput["src_cat"].data["e_max"]
+        ra = f_simput["src_cat"].data["ra"]
+        dec = f_simput["src_cat"].data["dec"]
+        spectra = f_simput["src_cat"].data["spectrum"]
+        if "IMAGE" in f_simput["src_cat"].columns.names:
+            images = f_simput["src_cat"].data["image"]
+        else:
+            images = ["NULL"]*len(spectra)
+        f_simput.close()
+
+        return cls(spectra, images, src_names, ra, dec, fluxes, e_min, e_max,
+                   filename)
+
+    def read_source(self, spec):
+        """
+        Read a source from the SIMPUT catalog with the identifier
+        *spec* for the SPECTRUM field.
+        """
+        from .spectra import Spectrum
+        from astropy.io.fits.column import _VLF
+        i = np.where(self.spectra == spec)[0][0]
+        src_file, extname, extver, row = _parse_catalog_entry(spec)
+        # If no file is specified, assume the catalog and
+        # source are in the same file
+        if src_file == "":
+            fn_src = self.filename
+        else:
+            fn_src = src_file
+        ext = extname if extver is None else (extname, extver)
+        data = pyfits.getdata(fn_src, ext)
+        if extname == "phlist":
+            ra = Quantity(data["ra"], "deg")
+            dec = Quantity(data["dec"], "deg")
+            energy = Quantity(data["energy"], "keV")
+            src = SimputPhotonList(ra, dec, energy, self.fluxes[i],
+                                   name=self.src_names[i])
+        elif extname == "spectrum":
+            emid = data["energy"]
+            flux = data["fluxdensity"]
+            if isinstance(data["energy"], _VLF):
+                emid = emid[0]
+                flux = flux[0]
+            elif row is not None:
+                if isinstance(row, str):
+                    row = np.where(data["name"])[0][0]
+                emid = emid[row, :]
+                flux = flux[row, :]
+            de = np.diff(emid)[0]
+            ebins = np.append(emid - 0.5 * de, emid[-1] + 0.5 * de)
+            spec = Spectrum(ebins, flux)
+            if self.images[i].upper() != "NULL":
+                src_file, extname, extver, _ = \
+                    _parse_catalog_entry(self.images[i])
+                # If no file is specified, assume the catalog and
+                # source are in the same file
+                if src_file == "":
+                    fn_img = self.filename
+                else:
+                    fn_img = src_file
+                ext = extname if extver is None else (extname, extver)
+                imdata, imheader = pyfits.getdata(
+                    fn_img, ext, header=True)
+                imhdu = pyfits.ImageHDU(data=imdata,
+                                        header=imheader)
+            else:
+                imhdu = None
+            src = SimputSpectrum(spec, self.ra[i], self.dec[i],
+                                 name=self.src_names[i], imhdu=imhdu)
+        else:
+            raise RuntimeError
+
+        return src
+
+    def _write_catalog(self, overwrite=False):
+        """
+        Write the SIMPUT catalog to disk.
+        """
+        src_id = np.arange(self.num_sources)
+        col1 = pyfits.Column(name='SRC_ID', format='J', array=src_id)
+        col2 = pyfits.Column(name='RA', format='D', array=self.ra)
+        col3 = pyfits.Column(name='DEC', format='D', array=self.dec)
+        col4 = pyfits.Column(name='E_MIN', format='D', array=self.emin)
+        col5 = pyfits.Column(name='E_MAX', format='D', array=self.emax)
+        col6 = pyfits.Column(name='FLUX', format='D', array=self.fluxes)
+        col7 = pyfits.Column(name='SPECTRUM', format='80A', array=self.spectra)
+        col8 = pyfits.Column(name='IMAGE', format='80A', array=self.images)
+        col9 = pyfits.Column(name='TIMING', format='80A', array=self.timing)
+        col10 = pyfits.Column(name='SRC_NAME', format='80A',
+                              array=self.src_names)
+
+        coldefs = pyfits.ColDefs([col1, col2, col3, col4, col5,
+                                  col6, col7, col8, col9, col10])
+
+        wrhdu = pyfits.BinTableHDU.from_columns(coldefs)
+        wrhdu.name = "SRC_CAT"
+
+        wrhdu.header["HDUCLASS"] = "HEASARC"
+        wrhdu.header["HDUCLAS1"] = "SIMPUT"
+        wrhdu.header["HDUCLAS2"] = "SRC_CAT"
+        wrhdu.header["HDUVERS"] = "1.1.0"
+        wrhdu.header["RADECSYS"] = "FK5"
+        wrhdu.header["EQUINOX"] = 2000.0
+        wrhdu.header["TUNIT2"] = "deg"
+        wrhdu.header["TUNIT3"] = "deg"
+        wrhdu.header["TUNIT4"] = "keV"
+        wrhdu.header["TUNIT5"] = "keV"
+        wrhdu.header["TUNIT6"] = "erg/s/cm**2"
+
+        if os.path.exists(self.filename) and not overwrite:
+            with pyfits.open(self.filename, mode='update') as f:
+                f["SRC_CAT"] = wrhdu
+                f.flush()
+        else:
+            f = [pyfits.PrimaryHDU(), wrhdu]
+            pyfits.HDUList(f).writeto(self.filename, overwrite=True)
+
+    def append(self, source, src_filename=None, overwrite=False):
+        """
+        Add a source to this catalog.
+
+        Parameters
+        ----------
+        source : :class:`~soxs.simput.SimputSource`
+            The SIMPUT source to append to this catalog.
+        src_filename : string, optional
+            If set, this will be the filename to write the source
+            to. By default, the source will be written to the same
+            file as the SIMPUT catalog.
+        overwrite : boolean, optional
+            Whether or not to overwrite an existing file with
+            the same name. If src_filename=None and the source is
+            to be written to the SIMPUT catalog file, then this
+            argument is ignored. If src_filename is another value,
+            it exists, and overwrite=False, the source will be
+            appended to the file. Default: False
+        """
+        self.src_names = np.append(self.src_names, source.name)
+        self.ra = np.append(self.ra, source.ra)
+        self.dec = np.append(self.dec, source.dec)
+        self.fluxes = np.append(self.fluxes, source.flux)
+        self.emin = np.append(self.emin, source.emin)
+        self.emax = np.append(self.emax, source.emax)
+        self.num_sources += 1
+
+        if src_filename is None:
+            src_filename = self.filename
+
+        if src_filename == self.filename:
+            # Don't overwrite the SIMPUT catalog file!!
+            overwrite = False
+
+        extver = _determine_extver(src_filename, source.src_type.upper())
+        spec_fn = src_filename if src_filename != self.filename else ""
+        spec = f"{spec_fn}[{source.src_type.upper()},{extver}]"
+        if source.imhdu is not None:
+            img_extver = _determine_extver(src_filename, "IMAGE")
+            img_fn = src_filename if src_filename != self.filename else ""
+            img = f"{img_fn}[IMAGE,{img_extver}]"
+        else:
+            img = "NULL"
+            img_extver = None
+        self.spectra = np.append(self.spectra, spec)
+        self.images = np.append(self.images, img)
+
+        self._write_catalog()
+        source._write_source(src_filename, extver, img_extver=img_extver,
+                             overwrite=overwrite)
+
+
+def _determine_extver(fn, extname):
+    extver = 1
+    if os.path.exists(fn):
+        with pyfits.open(fn) as f:
+            for hdu in f:
+                if hdu.name == extname:
+                    extver = hdu.header["EXTVER"]+1
+    return extver
+
+
+class SimputSource:
+    src_type = "null"
+
+    def __init__(self, emin, emax, flux, ra, dec, name=None, imhdu=None):
+        self.emin = emin
+        self.emax = emax
+        if name is None:
+            name = ""
+        self.name = name
+        self.flux = flux
+        self.ra = ra
+        self.dec = dec
+        self.imhdu = imhdu
+
+    def _get_source_hdu(self):
+        return None, None
+
+    def _write_source(self, filename, extver, img_extver=None, overwrite=False):
+        coldefs, header = self._get_source_hdu()
+
+        tbhdu = pyfits.BinTableHDU.from_columns(coldefs)
+        tbhdu.name = self.src_type.upper()
+
+        if self.src_type == "phlist":
+            hduclas1 = "PHOTONS"
+        else:
+            hduclas1 = self.src_type.upper()
+        tbhdu.header["HDUCLASS"] = "HEASARC/SIMPUT"
+        tbhdu.header["HDUCLAS1"] = hduclas1
+        tbhdu.header["HDUVERS"] = "1.1.0"
+        tbhdu.header.update(header)
+
+        tbhdu.header["EXTVER"] = extver
+        if self.imhdu is not None:
+            self.imhdu.header["EXTVER"] = img_extver
+
+        if os.path.exists(filename) and not overwrite:
+            mylog.info(f"Appending this source to {filename}.")
+            with pyfits.open(filename, mode='append') as f:
+                f.append(tbhdu)
+                if self.imhdu is not None:
+                    f.append(self.imhdu)
+                f.flush()
+        else:
+            if os.path.exists(filename):
+                mylog.warning(f"Overwriting {filename} with this source.")
+            else:
+                mylog.info(f"Writing source to {filename}.")
+            f = [pyfits.PrimaryHDU(), tbhdu]
+            if self.imhdu is not None:
+                f.append(self.imhdu)
+            pyfits.HDUList(f).writeto(filename, overwrite=overwrite)
+
+        if self.imhdu is not None:
+            self.imhdu.header["EXTVER"] = 1
+
+
+class SimputSpectrum(SimputSource):
+    src_type = "spectrum"
+
+    def __init__(self, spec, ra, dec, name=None, imhdu=None):
+        super(SimputSpectrum, self).__init__(spec.ebins.value.min(),
+                                             spec.ebins.value.max(),
+                                             spec.total_flux.value, ra,
+                                             dec, name=name, imhdu=imhdu)
+        self.spec = spec
+
+    def _get_source_hdu(self):
+        col1 = pyfits.Column(name='ENERGY', format='E',
+                             array=self.spec.emid.value)
+        col2 = pyfits.Column(name='FLUXDENSITY', format='D',
+                             array=self.spec.flux.value)
+        cols = [col1, col2]
+
+        coldefs = pyfits.ColDefs(cols)
+
+        header = {"REFRA": self.ra,
+                  "REFDEC": self.dec,
+                  "TUNIT1": "keV",
+                  "TUNIT2": "photon/(cm**2*s*keV)"}
+
+        return coldefs, header
+
+    @classmethod
+    def from_spectrum(cls, name, spectral_model, ra, dec, imhdu=None):
+        """
+        Generates a SIMPUT spectrum model for a point source
+        from a spectral model and a coordinate on the sky. An image
+        can be optionally included for an extended source.
 
         Parameters
         ----------
         name : string
-            The name of the SIMPUT catalog. This will be the prefix of 
-            the SIMPUT catalog file that is written from this SIMPUT 
-            catalog.
-        phlist_name : string
-            The name of the photon list. This will be the prefix of 
-            the photon list file which is created from the PhotonList 
-            object which is created here.
+            The name of the SIMPUT spectrum.
+        spectral_model : :class:`~soxs.spectra.Spectrum`
+            The spectral model to use to generate the event energies.
+        ra : float, (value, unit) tuple, or :class:`~astropy.units.Quantity`
+            The RA of the source in degrees.
+        dec : float, (value, unit) tuple, or :class:`~astropy.units.Quantity`
+            The Dec of the source in degrees.
+        imhdu : string or :class:`~astropy.io.fits.ImageHDU` instance
+            An image to be used to simulate an extended source. Can be an
+            ImageHDU instance or the name of a to read one from. If the
+            name contains an HDU extension, e.g. "cluster.fits[1]" or
+            "cluster.fits['perseus']", that extension will be loaded.
+        """
+        if isinstance(imhdu, str):
+            imhdu = process_fits_string(imhdu)
+        return cls(spectral_model, ra, dec, name=name, imhdu=imhdu)
+
+    @classmethod
+    def from_models(cls, name, spectral_model, spatial_model,
+                    width, nx):
+        """
+        Generate a SIMPUT spectrum from a spectral and a spatial
+        model, and parameters for an image.
+
+        Parameters
+        ----------
+        name : string
+            The name of the SIMPUT spectrum.
         spectral_model : :class:`~soxs.spectra.Spectrum`
             The spectral model to use to generate the event energies.
         spatial_model : :class:`~soxs.spatial.SpatialModel`
             The spatial model to use to generate the event coordinates.
-        t_exp : float, (value, unit) tuple, or :class:`~astropy.units.Quantity`
-            The exposure time in seconds.
-        area : float, (value, unit) tuple, or :class:`~astropy.units.Quantity`
-            The effective area in cm**2. If one is creating  events for a 
-            SIMPUT file, a constant should be used and it must be large 
-            enough so that a sufficiently large sample is drawn for the ARF.
-        prng : :class:`~numpy.random.RandomState` object, integer, or None
-            A pseudo-random number generator. Typically will only 
-            be specified if you have a reason to generate the same 
-            set of random numbers, such as for a test. Default is None, 
-            which sets the seed based on the system time.
-
+        width : float, (value, unit) tuple, or :class:`~astropy.units.Quantity`
+            The width of the image in arcminutes.
+        nx : integer
+            The resolution of the image, e.g. the number of pixels
+            on a side.
         """
-        photon_list = PhotonList.from_models(phlist_name, spectral_model, 
-                                             spatial_model, t_exp,
-                                             area, prng=prng)
-        return cls(name, photon_list)
+        imhdu = spatial_model.generate_image(width, nx)
+        return cls(spectral_model, spatial_model.ra0,
+                   spatial_model.dec0, name=name, imhdu=imhdu)
 
-    @classmethod
-    def from_file(cls, simput_file):
-        """
-        Generate a SIMPUT catalog object by reading it in from
-        disk. 
 
-        Parameters
-        ----------
-        simput_file : string
-            The name of the SIMPUT catalog file to read the 
-            catalog and photon lists from. 
-        """
-        photon_lists = []
-        name = simput_file.split("_simput.fits")[0]
-        events, parameters = read_simput_catalog(simput_file)
-        for i, params in enumerate(parameters):
-            ra = Quantity(events[i]["ra"], "deg")
-            dec = Quantity(events[i]["dec"], "deg")
-            energy = Quantity(events[i]["energy"], "keV")
-            phlist = PhotonList(params["sources"][i], ra, dec, energy,
-                                params[i]["flux"])
-            photon_lists.append(phlist)
+class SimputPhotonList(SimputSource):
+    src_type = "phlist"
 
-        return cls(name, photon_lists)
+    def __init__(self, ra, dec, energy, flux, name=None):
+        emin = np.asarray(energy).min()
+        emax = np.asarray(energy).max()
+        super(SimputPhotonList, self).__init__(
+            emin, emax, flux, 0.0, 0.0, name=name)
+        self.events = {"ra": ra, "dec": dec, "energy": energy}
+        self.num_events = energy.size
 
-    def __init__(self, name, photon_lists):
-        """
-        Create a SIMPUT catalog from a single photon list or multiple
-        photon lists.
+    def __getitem__(self, item):
+        return self.events[item]
 
-        Parameters
-        ----------
-        name : string
-            The name of the SIMPUT catalog. This will also be the prefix 
-            of any SIMPUT catalog file that is written from this object.
-        photon_lists : single or list of :class:`~soxs.simput.PhotonList` instances
-            The photon list(s) to create this catalog with.
-        """
-        self.name = name
-        self.photon_lists = ensure_list(photon_lists)
+    def __contains__(self, item):
+        return item in self.events
 
-    def write_catalog(self, overwrite=False):
-        """
-        Write the SIMPUT catalog and associated photon lists to disk.
-
-        Parameters
-        ----------
-        overwrite : boolean, optional
-            Whether or not to overwrite an existing file with 
-            the same name. Default: False
-        """
-        for i, phlist in enumerate(self.photon_lists):
-            if i == 0:
-                append = False
-                mylog.info("Writing SIMPUT catalog file %s_simput.fits." % self.name)
-            else:
-                append = True
-            mylog.info("Writing SIMPUT photon list file %s_phlist.fits." % phlist.name)
-            phlist.write_photon_list(self.name, append=append, overwrite=overwrite)
-
-    def append(self, photon_list):
-        """
-        Add a photon list to this catalog.
-
-        Parameters
-        ----------
-        photon_list : :class:`~soxs.simput.PhotonList`
-            The photon list to append to this catalog.
-        """
-        self.photon_lists.append(photon_list)
-
-class PhotonList(object):
+    def __iter__(self):
+        for key in self.events:
+            yield key
 
     @classmethod
     def from_models(cls, name, spectral_model, spatial_model,
                     t_exp, area, prng=None):
         """
-        Generate a single photon list from a spectral and a spatial
+        Generate a SIMPUT photon list from a spectral and a spatial
         model. 
 
         Parameters
         ----------
         name : string
-            The name of the photon list. This will also be the prefix 
-            of any photon list file that is written from this photon list.
+            The name of the SIMPUT photon list.
         spectral_model : :class:`~soxs.spectra.Spectrum`
             The spectral model to use to generate the event energies.
         spatial_model : :class:`~soxs.spatial.SpatialModel`
@@ -335,38 +502,26 @@ class PhotonList(object):
         area = parse_value(area, "cm**2")
         e = spectral_model.generate_energies(t_exp, area, prng=prng)
         ra, dec = spatial_model.generate_coords(e.size, prng=prng)
-        return cls(name, ra, dec, e, e.flux)
+        return cls(ra, dec, e, e.flux.value, name=name)
 
-    def __init__(self, name, ra, dec, energy, flux):
-        self.name = name
-        self.ra = ra
-        self.dec = dec
-        self.energy = energy
-        self.emin = energy.value.min()
-        self.emax = energy.value.max()
-        self.flux = flux
-        self.num_events = energy.size
+    def _get_source_hdu(self):
+        col1 = pyfits.Column(name='ENERGY', format='E',
+                             array=np.asarray(self["energy"]))
+        col2 = pyfits.Column(name='RA', format='D',
+                             array=np.asarray(self["ra"]))
+        col3 = pyfits.Column(name='DEC', format='D',
+                             array=np.asarray(self["dec"]))
+        cols = [col1, col2, col3]
 
-    def write_photon_list(self, simput_prefix, append=False, overwrite=False):
-        """
-        Write the photon list to disk, attaching it to a SIMPUT catalog.
+        coldefs = pyfits.ColDefs(cols)
 
-        Parameters
-        ----------
-        simput_prefix : string
-            The prefix of the SIMPUT catalog file to associate this
-            photon list with. If it does not exist, it will be created.
-        append : boolean, optional
-            If True, append to an existing SIMPUT catalog. If False,
-            overwrite an existing SIMPUT catalog with this name (if it
-            exists) and create a new one with this photon list. Default: False
-        overwrite : boolean, optional
-            Whether or not to overwrite an existing file with 
-            the same name. Default: False
-        """
-        write_photon_list(simput_prefix, self.name, self.flux,
-                          self.ra, self.dec, self.energy,
-                          append=append, overwrite=overwrite)
+        header = {"REFRA": 0.0,
+                  "REFDEC": 0.0,
+                  "TUNIT1": "keV",
+                  "TUNIT2": "deg",
+                  "TUNIT3": "deg"}
+
+        return coldefs, header
 
     def plot(self, center, width, s=None, c=None, marker=None, stride=1,
              emin=None, emax=None, label=None, fontsize=18, fig=None, 
@@ -418,16 +573,17 @@ class PhotonList(object):
         else:
             wcs = ax.wcs
         if emin is None:
-            emin = self.energy.value.min()
+            emin = self.emin
         else:
             emin = parse_value(emin, "keV")
         if emax is None:
-            emax = self.energy.value.max()
+            emax = self.emax
         else:
             emax = parse_value(emax, "keV")
-        idxs = np.logical_and(self.energy.value >= emin, self.energy.value <= emax)
-        ra = self.ra[idxs][::stride].value
-        dec = self.dec[idxs][::stride].value
+        idxs = np.logical_and(self["energy"].value >= emin, 
+                              self["energy"].value <= emax)
+        ra = self["ra"][idxs][::stride].value
+        dec = self["dec"][idxs][::stride].value
         x, y = wcs.wcs_world2pix(ra, dec, 1)
         ax.scatter(x, y, s=s, c=c, marker=marker, label=label, **kwargs)
         x0, y0 = wcs.wcs_world2pix(center[0], center[1], 1)
@@ -438,3 +594,17 @@ class PhotonList(object):
         ax.set_ylabel("Dec")
         ax.tick_params(axis='both', labelsize=fontsize)
         return fig, ax
+
+
+def write_photon_list(simput_prefix, phlist_prefix, flux, ra, dec, 
+                      energy, overwrite=False):
+    """
+    This function is designed to preserve backwards-compatibility
+    with pyXSIM 2.x. It will be removed in a future release.
+    """
+    simput_file = f"{simput_prefix}_simput.fits"
+    phlist_file = f"{phlist_prefix}_phlist.fits"
+    phlist = SimputPhotonList(ra, dec, energy, flux)
+    SimputCatalog.from_source(simput_file, phlist, 
+                              src_filename=phlist_file,
+                              overwrite=overwrite)

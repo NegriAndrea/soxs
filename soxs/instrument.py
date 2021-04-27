@@ -1,394 +1,16 @@
 import numpy as np
-import astropy.io.fits as pyfits
 import astropy.wcs as pywcs
-import astropy.units as u
 import os
 from collections import defaultdict
+from regions import PixCoord
 
-from soxs.constants import erg_per_keV, sigma_to_fwhm
-from soxs.simput import read_simput_catalog
-from soxs.utils import mylog, ensure_numpy_array, \
-    parse_prng, parse_value, get_rot_mat, soxs_cfg
 from soxs.events import write_event_file
 from soxs.instrument_registry import instrument_registry
-from tqdm import tqdm
-
-
-def get_response_path(fn):
-    if os.path.exists(fn):
-        return os.path.abspath(fn)
-    else:
-        resp_path = soxs_cfg.get("soxs", "response_path")
-        if not os.path.exists(resp_path):
-            raise IOError("The SOXS response directory %s does not exist!" % resp_path)
-        resp_fn = os.path.join(resp_path, fn)
-        if os.path.exists(resp_fn):
-            return resp_fn
-    raise IOError("Could not find file %s! Please download it from " % fn +
-                  "http://hea-www.cfa.harvard.edu/~jzuhone/soxs/responses.html "
-                  "and place it in the current working directory or place it in "
-                  "the SOXS response directory %s." % resp_path)
-
-
-class AuxiliaryResponseFile(object):
-    r"""
-    A class for auxiliary response files (ARFs).
-
-    Parameters
-    ----------
-    filename : string
-        The filename of the ARF to be read.
-
-    Examples
-    --------
-    >>> arf = AuxiliaryResponseFile("xrs_mucal_3x10_3.0eV.arf")
-    """
-    def __init__(self, filename):
-        self.filename = get_response_path(filename)
-        f = pyfits.open(self.filename)
-        self.elo = f["SPECRESP"].data.field("ENERG_LO")
-        self.ehi = f["SPECRESP"].data.field("ENERG_HI")
-        self.emid = 0.5*(self.elo+self.ehi)
-        self.eff_area = np.nan_to_num(f["SPECRESP"].data.field("SPECRESP")).astype("float64")
-        self.max_area = self.eff_area.max()
-        f.close()
-
-    @classmethod
-    def from_instrument(cls, name):
-        """
-        Return an :class:`~soxs.instrument.AuxiliaryResponseFile`
-        object from the name of an existing instrument
-        specification in SOXS.
-
-        Parameters
-        ----------
-        name : string
-            The name of the instrument specification to use 
-            to obtain the ARF object from.
-
-        Examples
-        --------
-        >>> arf = soxs.AuxiliaryResponseFile.from_instrument("hdxi")
-        """
-        instr = instrument_registry.get(name, None)
-        if instr is None:
-            raise KeyError("Instrument '%s' not in registry!" % name)
-        return cls(instr["arf"])
-
-    def __str__(self):
-        return self.filename
-
-    def interpolate_area(self, energy):
-        """
-        Interpolate the effective area to the energies 
-        provided  by the supplied *energy* array.
-        """
-        earea = np.interp(np.asarray(energy), self.emid, self.eff_area, 
-                          left=0.0, right=0.0)
-        return u.Quantity(earea, "cm**2")
-
-    def detect_events(self, events, exp_time, flux, refband, prng=None):
-        """
-        Use the ARF to determine a subset of photons which 
-        will be detected. Returns a boolean NumPy array 
-        which is the same is the same size as the number 
-        of photons, wherever it is "true" means those photons 
-        have been detected.
-
-        Parameters
-        ----------
-        events : dict of np.ndarrays
-            The energies and positions of the photons. 
-        exp_time : float
-            The exposure time in seconds.
-        flux : float
-            The total flux of the photons in erg/s/cm^2. 
-        refband : array_like
-            A two-element array or list containing the limits 
-            of the energy band which the flux was computed in. 
-        prng : :class:`~numpy.random.RandomState` object, integer, or None
-            A pseudo-random number generator. Typically will only 
-            be specified if you have a reason to generate the same 
-            set of random numbers, such as for a test. Default is None, 
-            which sets the seed based on the system time. 
-        """
-        prng = parse_prng(prng)
-        energy = events["energy"]
-        if energy.size == 0:
-            return events
-        earea = self.interpolate_area(energy).value
-        idxs = np.logical_and(energy >= refband[0], energy <= refband[1])
-        rate = flux/(energy[idxs].sum()*erg_per_keV)*earea[idxs].sum()
-        n_ph = prng.poisson(lam=rate*exp_time)
-        fak = float(n_ph)/energy.size
-        if fak > 1.0:
-            mylog.error("Number of events in sample: %d, Number of events wanted: %d" % (energy.size, n_ph))
-            raise ValueError("This combination of exposure time and effective area "
-                             "will result in more photons being drawn than are available "
-                             "in the sample!!!")
-        w = earea / self.max_area
-        randvec = prng.uniform(size=energy.size)
-        eidxs = prng.permutation(np.where(randvec < w)[0])[:n_ph].astype("int64")
-        mylog.info("%s events detected." % n_ph)
-        for key in events:
-            events[key] = events[key][eidxs]
-        return events
-
-    def plot(self, xscale="log", yscale="log", xlabel=None,
-             ylabel=None, fig=None, ax=None, **kwargs):
-        """
-        Make a quick plot of the effective area curve.
-
-        Parameters
-        ----------
-        xscale : string
-            The scale of the x-axis. "linear" or "log".
-        yscale : string
-            The scale of the y-axis. "linear" or "log".
-        xlabel : string
-            The label of the x-axis. Default: "E (keV)"
-        ylabel : string
-            The label of the y-axis. Default: "$\mathrm{A\ (cm^2)}$"
-        fig : :class:`~matplotlib.figure.Figure`, optional
-            The figure to place the plot in. If not supplied, 
-            one will be created.
-        ax : :class:`~matplotlib.axes.Axes`, optional
-            The axes to place the plot in. If not supplied, 
-            one will be created.
-
-        All other arguments are passed to the call to 
-        :meth:`~matplotlib.axes.Axes.plot`.
-
-        Returns
-        -------
-
-        A tuple of the :class:`~matplotlib.figure.Figure` and 
-        :class:`~matplotlib.axes.Axes` objects.
-        """
-        import matplotlib.pyplot as plt
-        if xlabel is None:
-            xlabel = "E (keV)"
-        if ylabel is None:
-            ylabel = "$\mathrm{A\ (cm^2)}$"
-        if fig is None:
-            fig = plt.figure(figsize=(10, 10))
-        if ax is None:
-            ax = fig.add_subplot(111)
-        ax.plot(self.emid, self.eff_area, **kwargs)
-        ax.set_xscale(xscale)
-        ax.set_yscale(yscale)
-        ax.set_xlabel(xlabel)
-        ax.set_ylabel(ylabel)
-        return fig, ax
-
-
-class FlatResponse(AuxiliaryResponseFile):
-    """
-    A flat effective area response.
-
-    Parameters
-    ----------
-    emin : float
-        The minimum energy of the response in keV.
-    emax : float
-        The maximum energy of the response in keV. 
-    area : float
-        The effective area in cm**2. 
-    nbins : integer
-        The number of bins in the response file. 
-
-    Examples
-    --------
-    >>> arf = FlatResponse(0.1, 10.0, 3000.0, 10000)
-    """
-    def __init__(self, emin, emax, area, nbins):
-        self.filename = "flat_response"
-        de = (emax-emin)/nbins
-        self.elo = np.arange(nbins)*de + emin
-        self.ehi = self.elo + de
-        self.emid = 0.5*(self.elo+self.ehi)
-        self.eff_area = area*np.ones(nbins)
-        self.max_area = area
-
-
-class RedistributionMatrixFile(object):
-    r"""
-    A class for redistribution matrix files (RMFs).
-
-    Parameters
-    ----------
-    filename : string
-        The filename of the RMF to be read.
-
-    Examples
-    --------
-    >>> rmf = RedistributionMatrixFile("xrs_hdxi.rmf")
-    """
-    def __init__(self, filename):
-        self.filename = get_response_path(filename)
-        self.handle = pyfits.open(self.filename, memmap=True)
-        if "MATRIX" in self.handle:
-            self.mat_key = "MATRIX"
-        elif "SPECRESP MATRIX" in self.handle:
-            self.mat_key = "SPECRESP MATRIX"
-        else:
-            raise RuntimeError("Cannot find the response matrix in the RMF "
-                               "file %s! " % filename+"It should be named "
-                               "\"MATRIX\" or \"SPECRESP MATRIX\".")
-        self.header = self.handle[self.mat_key].header
-        self.num_mat_columns = len(self.handle[self.mat_key].columns)
-        self.ebounds_header = self.handle["EBOUNDS"].header
-        self.weights = np.array([w.sum() for w in self.data["MATRIX"]])
-        self.elo = self.data["ENERG_LO"]
-        self.ehi = self.data["ENERG_HI"]
-        self.ebins = np.append(self.data["ENERG_LO"], self.data["ENERG_HI"][-1])
-        self.emid = 0.5*(self.elo+self.ehi)
-        self.de = self.ehi-self.elo
-        self.n_e = self.elo.size
-        self.n_ch = self.header["DETCHANS"]
-        num = 0
-        for i in range(1, self.num_mat_columns+1):
-            if self.header["TTYPE%d" % i] == "F_CHAN":
-                num = i
-                break
-        self.cmin = self.header.get("TLMIN%d" % num, 1)
-        self.cmax = self.header.get("TLMAX%d" % num, self.n_ch)
-
-    @classmethod
-    def from_instrument(cls, name):
-        """
-        Return an :class:`~soxs.instrument.RedistributionMatrixFile`
-        object from the name of an existing instrument
-        specification in SOXS.
-
-        Parameters
-        ----------
-        name : string
-            The name of the instrument specification to use 
-            to obtain the RMF object from.
-
-        Examples
-        --------
-        >>> arf = soxs.RedistributionMatrixFile.from_instrument("hdxi")
-        """
-        instr = instrument_registry.get(name, None)
-        if instr is None:
-            raise KeyError("Instrument '%s' not in registry!" % name)
-        return cls(instr["rmf"])
-
-    @property
-    def data(self):
-        return self.handle[self.mat_key].data
-
-    @property
-    def ebounds_data(self):
-        return self.handle["EBOUNDS"].data
-
-    def __str__(self):
-        return self.filename
-
-    def _make_channels(self, k):
-        # build channel number list associated to array value,
-        # there are groups of channels in rmfs with nonzero probabilities
-        trueChannel = []
-        f_chan = ensure_numpy_array(np.nan_to_num(self.data["F_CHAN"][k]))
-        n_chan = ensure_numpy_array(np.nan_to_num(self.data["N_CHAN"][k]))
-        for start, nchan in zip(f_chan, n_chan):
-            if nchan == 0:
-                trueChannel.append(start)
-            else:
-                trueChannel += list(range(start, start + nchan))
-        return np.array(trueChannel)
-
-    def e_to_ch(self, energy):
-        energy = parse_value(energy, "keV")
-        return np.searchsorted(self.ebounds_data["E_MIN"], energy)-1
-
-    def scatter_energies(self, events, prng=None):
-        """
-        Scatter photon energies with the RMF and produce the 
-        corresponding channel values.
-
-        Parameters
-        ----------
-        events : dict of np.ndarrays
-            The energies and positions of the photons. 
-        prng : :class:`~numpy.random.RandomState` object, integer, or None
-            A pseudo-random number generator. Typically will only 
-            be specified if you have a reason to generate the same 
-            set of random numbers, such as for a test. Default is None, 
-            which sets the seed based on the system time. 
-        """
-        prng = parse_prng(prng)
-        eidxs = np.argsort(events["energy"])
-        sorted_e = events["energy"][eidxs]
-
-        detectedChannels = []
-
-        # run through all photon energies and find which bin they go in
-        fcurr = 0
-        last = sorted_e.shape[0]
-
-        emin = sorted_e[0]
-        emax = sorted_e[-1]
-
-        pbar = tqdm(leave=True, total=last, desc="Scattering energies ")
-        for (k, low), high in zip(enumerate(self.elo), self.ehi):
-            if high < emin or low > emax:
-                continue
-            e = sorted_e[fcurr:last]
-            nn = np.logical_and(low <= e, e < high).sum()
-            if nn == 0:
-                continue
-            # weight function for probabilities from RMF
-            weights = np.nan_to_num(np.float64(self.data["MATRIX"][k]))
-            weights /= weights.sum()
-            trueChannel = self._make_channels(k)
-            if len(trueChannel) > 0:
-                channelInd = prng.choice(len(weights), size=nn, p=weights)
-                detectedChannels.append(trueChannel[channelInd])
-                fcurr += nn
-                pbar.update(nn)
-
-        pbar.close()
-
-        for key in events:
-            events[key] = events[key][eidxs]
-        events[self.header["CHANTYPE"]] = np.concatenate(detectedChannels)
-
-        return events
-
-    def convolve_spectrum(self, cspec, exp_time, noisy=True, prng=None):
-        prng = parse_prng(prng)
-        exp_time = parse_value(exp_time, "s")
-        counts = cspec.flux.value * exp_time * cspec.de.value
-        spec = np.histogram(cspec.emid.value, self.ebins, weights=counts)[0]
-        conv_spec = np.zeros(self.n_ch)
-        pbar = tqdm(leave=True, total=self.n_e, desc="Convolving spectrum ")
-        if np.all(self.data["N_GRP"] == 1):
-            # We can do things a bit faster if there is only one group each
-            f_chan = ensure_numpy_array(np.nan_to_num(self.data["F_CHAN"]))
-            n_chan = ensure_numpy_array(np.nan_to_num(self.data["N_CHAN"]))
-            mat = np.nan_to_num(np.float64(self.data["MATRIX"]))
-            mat_size = np.minimum(n_chan, self.n_ch-f_chan)
-            for k in range(self.n_e):
-                conv_spec[f_chan[k]:f_chan[k]+n_chan[k]] += spec[k]*mat[k,:mat_size[k]]
-                pbar.update()
-        else:
-            # Otherwise, we have to go step-by-step
-            for k in range(self.n_e):
-                f_chan = ensure_numpy_array(np.nan_to_num(self.data["F_CHAN"][k]))
-                n_chan = ensure_numpy_array(np.nan_to_num(self.data["N_CHAN"][k]))
-                mat = np.nan_to_num(np.float64(self.data["MATRIX"][k]))
-                mat_size = np.minimum(n_chan, self.n_ch-f_chan)
-                for i, f in enumerate(f_chan):
-                    conv_spec[f:f+n_chan[i]] += spec[k]*mat[:mat_size[i]]
-                pbar.update()
-        pbar.close()
-        if noisy:
-            return prng.poisson(lam=conv_spec)
-        else:
-            return conv_spec
+from soxs.psf import psf_model_registry
+from soxs.response import AuxiliaryResponseFile, RedistributionMatrixFile
+from soxs.simput import read_simput_catalog, SimputPhotonList
+from soxs.utils import mylog, parse_prng, parse_value, \
+    get_rot_mat, create_region, get_data_file, ensure_numpy_array
 
 
 def perform_dither(t, dither_dict):
@@ -405,9 +27,10 @@ def perform_dither(t, dither_dict):
     return x_offset, y_offset
 
 
-def generate_events(input_events, exp_time, instrument, sky_center, 
+def generate_events(source, exp_time, instrument, sky_center, 
                     no_dither=False, dither_params=None, 
-                    roll_angle=0.0, subpixel_res=False, prng=None):
+                    roll_angle=0.0, subpixel_res=False, 
+                    aimpt_shift=None, prng=None):
     """
     Take unconvolved events and convolve them with instrumental responses. This 
     function does the following:
@@ -449,49 +72,59 @@ def generate_events(input_events, exp_time, instrument, sky_center,
         Default: [8.0, 8.0, 1000.0, 707.0].
     roll_angle : float, (value, unit) tuple, or :class:`~astropy.units.Quantity`, optional
         The roll angle of the observation in degrees. Default: 0.0
-    subpixel_res: boolean, optional
+    subpixel_res : boolean, optional
         If True, event positions are not randomized within the pixels 
         within which they are detected. Default: False
+    aimpt_shift : array-like, optional
+        A two-float array-like object which shifts the aimpoint on the 
+        detector from the nominal position. Units are in arcseconds.
+        Default: None, which results in no shift from the nominal aimpoint. 
     prng : :class:`~numpy.random.RandomState` object, integer, or None
         A pseudo-random number generator. Typically will only 
         be specified if you have a reason to generate the same 
         set of random numbers, such as for a test. Default is None, 
         which sets the seed based on the system time. 
     """
-    import pyregion._region_filter as rfilter
     exp_time = parse_value(exp_time, "s")
     roll_angle = parse_value(roll_angle, "deg")
     prng = parse_prng(prng)
-    if isinstance(input_events, dict):
+    if source is None:
+        source_list = []
+    elif isinstance(source, dict):
         parameters = {}
-        for key in ["flux", "emin", "emax", "sources"]:
-            parameters[key] = input_events[key]
-        event_list = []
+        for key in ["flux", "emin", "emax", "src_names"]:
+            parameters[key] = source[key]
+        source_list = []
         for i in range(len(parameters["flux"])):
-            edict = {}
-            for key in ["ra", "dec", "energy"]:
-                edict[key] = input_events[key][i]
-            event_list.append(edict)
-    elif isinstance(input_events, str):
+            phlist = SimputPhotonList(source["ra"][i], source["dec"][i],
+                                      source["energy"][i], parameters['flux'][i],
+                                      parameters['src_names'][i])
+            source_list.append(phlist)
+    elif isinstance(source, str):
         # Assume this is a SIMPUT catalog
-        event_list, parameters = read_simput_catalog(input_events)
+        source_list, parameters = read_simput_catalog(source)
 
     try:
         instrument_spec = instrument_registry[instrument]
     except KeyError:
-        raise KeyError("Instrument %s is not in the instrument registry!" % instrument)
+        raise KeyError(f"Instrument {instrument} is not in the instrument registry!")
     if not instrument_spec["imaging"]:
-        raise RuntimeError("Instrument '%s' is not " % instrument_spec["name"] +
-                           "designed for imaging observations!")
+        raise RuntimeError(f"Instrument '{instrument_spec['name']}' is not "
+                           f"designed for imaging observations!")
 
-    arf_file = get_response_path(instrument_spec["arf"])
-    rmf_file = get_response_path(instrument_spec["rmf"])
+    arf_file = get_data_file(instrument_spec["arf"])
+    rmf_file = get_data_file(instrument_spec["rmf"])
     arf = AuxiliaryResponseFile(arf_file)
     rmf = RedistributionMatrixFile(rmf_file)
 
     nx = instrument_spec["num_pixels"]
     plate_scale = instrument_spec["fov"]/nx/60. # arcmin to deg
     plate_scale_arcsec = plate_scale * 3600.0
+
+    if aimpt_shift is None:
+        aimpt_shift = np.zeros(2)
+    aimpt_shift = ensure_numpy_array(aimpt_shift).astype('float64')
+    aimpt_shift /= plate_scale_arcsec
 
     if not instrument_spec["dither"]:
         dither_on = False
@@ -506,25 +139,27 @@ def generate_events(input_events, exp_time, instrument, sky_center,
                    "dither_on": dither_on,
                    "plate_scale": plate_scale_arcsec}
 
-    event_params = {}
-    event_params["exposure_time"] = exp_time
-    event_params["arf"] = arf.filename
-    event_params["sky_center"] = sky_center
-    event_params["pix_center"] = np.array([0.5*(2*nx+1)]*2)
-    event_params["num_pixels"] = nx
-    event_params["plate_scale"] = plate_scale
-    event_params["rmf"] = rmf.filename
-    event_params["channel_type"] = rmf.header["CHANTYPE"]
-    event_params["telescope"] = rmf.header["TELESCOP"]
-    event_params["instrument"] = instrument_spec['name']
-    event_params["mission"] = rmf.header.get("MISSION", "")
-    event_params["nchan"] = rmf.n_ch
-    event_params["roll_angle"] = roll_angle
-    event_params["fov"] = instrument_spec["fov"]
-    event_params["chan_lim"] = [rmf.cmin, rmf.cmax]
-    event_params["chips"] = instrument_spec["chips"]
-    event_params["dither_params"] = dither_dict
-    event_params["aimpt_coords"] = instrument_spec["aimpt_coords"]
+    event_params = {"exposure_time": exp_time,
+                    "arf": arf.filename,
+                    "sky_center": sky_center,
+                    "pix_center": np.array([0.5*(2*nx+1)]*2),
+                    "num_pixels": nx,
+                    "plate_scale": plate_scale,
+                    "rmf": rmf.filename,
+                    "channel_type": rmf.chan_type,
+                    "telescope": rmf.header["TELESCOP"],
+                    "instrument": instrument_spec['name'],
+                    "mission": rmf.header.get("MISSION", ""),
+                    "nchan": rmf.n_ch,
+                    "roll_angle": roll_angle,
+                    "fov": instrument_spec["fov"],
+                    "chan_lim": [rmf.cmin, rmf.cmax],
+                    "chips": instrument_spec["chips"],
+                    "dither_params": dither_dict,
+                    "aimpt_coords": instrument_spec["aimpt_coords"],
+                    "aimpt_shift": aimpt_shift}
+
+    # Set up WCS
 
     w = pywcs.WCS(naxis=2)
     w.wcs.crval = event_params["sky_center"]
@@ -533,19 +168,31 @@ def generate_events(input_events, exp_time, instrument, sky_center,
     w.wcs.ctype = ["RA---TAN","DEC--TAN"]
     w.wcs.cunit = ["deg"]*2
 
+    # Determine rotation matrix
     rot_mat = get_rot_mat(roll_angle)
+
+    # Set up PSF
+    psf_type = instrument_spec["psf"][0]
+    psf_class = psf_model_registry[psf_type]
+    psf = psf_class(instrument_spec, prng=prng)
 
     all_events = defaultdict(list)
 
-    for i, evts in enumerate(event_list):
+    for i, src in enumerate(source_list):
 
-        mylog.info("Detecting events from source %s." % parameters["sources"][i])
+        mylog.info(f"Detecting events from source {parameters['src_names'][i]}")
 
         # Step 1: Use ARF to determine which photons are observed
 
-        mylog.info("Applying energy-dependent effective area from %s." % os.path.split(arf.filename)[-1])
+        mylog.info(f"Applying energy-dependent effective area from "
+                   f"{os.path.split(arf.filename)[-1]}.")
         refband = [parameters["emin"][i], parameters["emax"][i]]
-        events = arf.detect_events(evts, exp_time, parameters["flux"][i], refband, prng=prng)
+        if src.src_type == "phlist":
+            events = arf.detect_events_phlist(src.events.copy(), exp_time,
+                                              parameters["flux"][i], 
+                                              refband, prng=prng)
+        elif src.src_type.endswith("spectrum"):
+            events = arf.detect_events_spec(src, exp_time, refband, prng=prng)
 
         n_evt = events["energy"].size
 
@@ -572,8 +219,8 @@ def generate_events(input_events, exp_time, instrument, sky_center,
             # Rotate physical coordinates to detector coordinates
 
             det = np.dot(rot_mat, np.array([xpix, ypix]))
-            detx = det[0,:] + event_params["aimpt_coords"][0]
-            dety = det[1,:] + event_params["aimpt_coords"][1]
+            detx = det[0, :] + event_params["aimpt_coords"][0] + aimpt_shift[0]
+            dety = det[1, :] + event_params["aimpt_coords"][1] + aimpt_shift[1]
 
             # Add times to events
             events['time'] = prng.uniform(size=n_evt, low=0.0,
@@ -588,14 +235,8 @@ def generate_events(input_events, exp_time, instrument, sky_center,
 
             # PSF scattering of detector coordinates
 
-            if instrument_spec["psf"] is not None:
-                psf_type, psf_spec = instrument_spec["psf"]
-                if psf_type == "gaussian":
-                    sigma = psf_spec/sigma_to_fwhm/plate_scale_arcsec
-                    detx += prng.normal(loc=0.0, scale=sigma, size=n_evt)
-                    dety += prng.normal(loc=0.0, scale=sigma, size=n_evt)
-                else:
-                    raise NotImplementedError("PSF type %s not implemented!" % psf_type)
+            mylog.info(f"Scattering events with a {psf}-based PSF.")
+            detx, dety = psf.scatter(detx, dety, events["energy"])
 
             # Convert detector coordinates to chip coordinates.
             # Throw out events that don't fall on any chip.
@@ -603,29 +244,22 @@ def generate_events(input_events, exp_time, instrument, sky_center,
             cx = np.trunc(detx)+0.5*np.sign(detx)
             cy = np.trunc(dety)+0.5*np.sign(dety)
 
-            if event_params["chips"] is None:
-                events["chip_id"] = np.zeros(n_evt, dtype='int')
-                keepx = np.logical_and(cx >= -0.5*nx, cx <= 0.5*nx)
-                keepy = np.logical_and(cy >= -0.5*nx, cy <= 0.5*nx)
-                keep = np.logical_and(keepx, keepy)
-            else:
-                events["chip_id"] = -np.ones(n_evt, dtype='int')
-                for i, chip in enumerate(event_params["chips"]):
-                    thisc = np.ones(n_evt, dtype='bool')
-                    rtype = chip[0]
-                    args = chip[1:]
-                    r = getattr(rfilter, rtype)(*args)
-                    inside = r.inside(cx, cy)
-                    thisc = np.logical_and(thisc, inside)
-                    events["chip_id"][thisc] = i
-                keep = events["chip_id"] > -1
+            events["chip_id"] = -np.ones(n_evt, dtype='int')
+            for i, chip in enumerate(event_params["chips"]):
+                rtype = chip[0]
+                args = chip[1:]
+                r, _ = create_region(rtype, args, 0.0, 0.0)
+                inside = r.contains(PixCoord(cx, cy))
+                events["chip_id"][inside] = i
+            keep = events["chip_id"] > -1
 
-            mylog.info("%d events were rejected because " % (n_evt-keep.sum()) +
-                       "they do not fall on any CCD.")
+            mylog.info(f"{n_evt-keep.sum()} events were rejected because "
+                       f"they do not fall on any CCD.")
             n_evt = keep.sum()
 
             if n_evt == 0:
-                mylog.warning("No events are within the field of view for this source!!!")
+                mylog.warning("No events are within the field "
+                              "of view for this source!!!")
             else:
 
                 # Keep only those events which fall on a chip
@@ -633,22 +267,29 @@ def generate_events(input_events, exp_time, instrument, sky_center,
                 for key in events:
                     events[key] = events[key][keep]
 
-                # Convert chip coordinates back to detector coordinates, unless the
-                # user has specified that they want subpixel resolution
+                # Convert chip coordinates back to detector coordinates,
+                # unless the user has specified that they want subpixel
+                # resolution
 
                 if subpixel_res:
                     events["detx"] = detx[keep]
                     events["dety"] = dety[keep]
                 else:
-                    events["detx"] = cx[keep] + prng.uniform(low=-0.5, high=0.5, size=n_evt)
-                    events["dety"] = cy[keep] + prng.uniform(low=-0.5, high=0.5, size=n_evt)
+                    events["detx"] = cx[keep] + \
+                                     prng.uniform(low=-0.5, high=0.5, size=n_evt)
+                    events["dety"] = cy[keep] + \
+                                     prng.uniform(low=-0.5, high=0.5, size=n_evt)
 
                 # Convert detector coordinates back to pixel coordinates by
                 # adding the dither offsets back in and applying the rotation
                 # matrix again
 
-                det = np.array([events["detx"] + x_offset[keep] - event_params["aimpt_coords"][0],
-                                events["dety"] + y_offset[keep] - event_params["aimpt_coords"][1]])
+                det = np.array([events["detx"] + x_offset[keep] -
+                                event_params["aimpt_coords"][0] -
+                                aimpt_shift[0],
+                                events["dety"] + y_offset[keep] -
+                                event_params["aimpt_coords"][1] -
+                                aimpt_shift[1]])
                 pix = np.dot(rot_mat.T, det)
 
                 events["xpix"] = pix[0,:] + event_params['pix_center'][0]
@@ -659,23 +300,27 @@ def generate_events(input_events, exp_time, instrument, sky_center,
                 all_events[key] = np.concatenate([all_events[key], events[key]])
 
     if len(all_events["energy"]) == 0:
-        mylog.warning("No events from any of the sources in the catalog were detected!")
-        for key in ["xpix", "ypix", "detx", "dety", "time", "chip_id", event_params["channel_type"]]:
+        mylog.warning("No events from any of the sources in "
+                      "the catalog were detected!")
+        for key in ["xpix", "ypix", "detx", "dety", "time", 
+                    "chip_id", event_params["channel_type"]]:
             all_events[key] = np.array([])
     else:
         # Step 4: Scatter energies with RMF
-        mylog.info("Scattering energies with RMF %s." % os.path.split(rmf.filename)[-1])
+        mylog.info(f"Scattering energies with "
+                   f"RMF {os.path.split(rmf.filename)[-1]}.")
         all_events = rmf.scatter_energies(all_events, prng=prng)
 
     return all_events, event_params
 
 
-def make_background(exp_time, instrument, sky_center, foreground=True, 
+def make_background(exp_time, instrument, sky_center, foreground=True,
                     ptsrc_bkgnd=True, instr_bkgnd=True, no_dither=False,
-                    dither_params=None, roll_angle=0.0, subpixel_res=False, 
-                    input_sources=None, absorb_model="wabs", nH=0.05, prng=None):
+                    dither_params=None, roll_angle=0.0, subpixel_res=False,
+                    input_sources=None, absorb_model="wabs", nH=0.05, 
+                    aimpt_shift=None, prng=None):
     """
-    Make background events. 
+    Make background events.
 
     Parameters
     ----------
@@ -715,6 +360,10 @@ def make_background(exp_time, instrument, sky_center, foreground=True,
     nH : float, optional
         The hydrogen column in units of 10**22 atoms/cm**2. 
         Default: 0.05
+    aimpt_shift : array-like, optional
+        A two-float array-like object which shifts the aimpoint on the 
+        detector from the nominal position. Units are in arcseconds.
+        Default: None, which results in no shift from the nominal aimpoint. 
     prng : :class:`~numpy.random.RandomState` object, integer, or None
         A pseudo-random number generator. Typically will only 
         be specified if you have a reason to generate the same 
@@ -729,24 +378,25 @@ def make_background(exp_time, instrument, sky_center, foreground=True,
     try:
         instrument_spec = instrument_registry[instrument]
     except KeyError:
-        raise KeyError("Instrument %s is not in the instrument registry!" % instrument)
+        raise KeyError(f"Instrument {instrument} is not in the "
+                       f"instrument registry!")
     if not instrument_spec["imaging"]:
-        raise RuntimeError("Instrument '%s' is not " % instrument_spec["name"] +
-                           "designed for imaging observations!")
+        raise RuntimeError(f"Instrument '{instrument_spec['name']}' is not "
+                           f"designed for imaging observations!")
     fov = instrument_spec["fov"]
 
     input_events = defaultdict(list)
 
-    arf_file = get_response_path(instrument_spec["arf"])
+    arf_file = get_data_file(instrument_spec["arf"])
     arf = AuxiliaryResponseFile(arf_file)
-    rmf_file = get_response_path(instrument_spec["rmf"])
+    rmf_file = get_data_file(instrument_spec["rmf"])
     rmf = RedistributionMatrixFile(rmf_file)
 
     if ptsrc_bkgnd:
         mylog.info("Adding in point-source background.")
         ptsrc_events = make_ptsrc_background(exp_time, fov, sky_center,
                                              area=1.2*arf.max_area,
-                                             input_sources=input_sources, 
+                                             input_sources=input_sources,
                                              absorb_model=absorb_model,
                                              nH=nH, prng=prng)
         for key in ["ra", "dec", "energy"]:
@@ -754,17 +404,25 @@ def make_background(exp_time, instrument, sky_center, foreground=True,
         input_events["flux"].append(ptsrc_events["flux"])
         input_events["emin"].append(ptsrc_events["energy"].min())
         input_events["emax"].append(ptsrc_events["energy"].max())
-        input_events["sources"].append("ptsrc_bkgnd")
+        input_events["src_names"].append("ptsrc_bkgnd")
         events, event_params = generate_events(input_events, exp_time,
                                                instrument, sky_center,
                                                no_dither=no_dither,
-                                               dither_params=dither_params, 
+                                               dither_params=dither_params,
                                                roll_angle=roll_angle,
                                                subpixel_res=subpixel_res,
+                                               aimpt_shift=aimpt_shift,
                                                prng=prng)
-        mylog.info("Generated %d photons from the point-source background." % len(events["energy"]))
+        mylog.info(f"Generated {events['energy'].size} photons from "
+                   f"the point-source background.")
     else:
         nx = instrument_spec["num_pixels"]
+        plate_scale = instrument_spec["fov"]/nx/60.0
+        plate_scale_arcsec = plate_scale*3600.0
+        if aimpt_shift is None:
+            aimpt_shift = np.zeros(2)
+        aimpt_shift = ensure_numpy_array(aimpt_shift).astype('float64')
+        aimpt_shift /= plate_scale_arcsec
         events = defaultdict(list)
         if not instrument_spec["dither"]:
             dither_on = False
@@ -785,7 +443,7 @@ def make_background(exp_time, instrument, sky_center, foreground=True,
                         "channel_type": rmf.header["CHANTYPE"],
                         "sky_center": sky_center,
                         "dither_params": dither_dict,
-                        "plate_scale": instrument_spec["fov"]/nx/60.0,
+                        "plate_scale": plate_scale,
                         "chan_lim": [rmf.cmin, rmf.cmax],
                         "rmf": rmf_file, "arf": arf_file,
                         "telescope": rmf.header["TELESCOP"],
@@ -793,7 +451,8 @@ def make_background(exp_time, instrument, sky_center, foreground=True,
                         "mission": rmf.header.get("MISSION", ""),
                         "nchan": rmf.n_ch,
                         "roll_angle": roll_angle,
-                        "aimpt_coords": instrument_spec["aimpt_coords"]}
+                        "aimpt_coords": instrument_spec["aimpt_coords"],
+                        "aimpt_shift": aimpt_shift}
 
     if "chips" not in event_params:
         event_params["chips"] = instrument_spec["chips"]
@@ -805,12 +464,13 @@ def make_background(exp_time, instrument, sky_center, foreground=True,
             events[key] = np.concatenate([events[key], bkg_events[key]])
     if instr_bkgnd and instrument_spec["bkgnd"] is not None:
         mylog.info("Adding in instrumental background.")
-        bkg_events = make_instrument_background(instrument_spec["bkgnd"], 
+        bkg_events = make_instrument_background(instrument_spec,
                                                 event_params, rmf, prng=prng)
         for key in bkg_events:
             events[key] = np.concatenate([events[key], bkg_events[key]])
 
     return events, event_params
+
 
 def make_background_file(out_file, exp_time, instrument, sky_center,
                          overwrite=False, foreground=True, instr_bkgnd=True,
@@ -878,12 +538,14 @@ def make_background_file(out_file, exp_time, instrument, sky_center,
                                            nH=nH, prng=prng)
     write_event_file(events, event_params, out_file, overwrite=overwrite)
 
+
 def instrument_simulator(input_events, out_file, exp_time, instrument,
                          sky_center, overwrite=False, instr_bkgnd=True, 
                          foreground=True, ptsrc_bkgnd=True, 
                          bkgnd_file=None, no_dither=False, 
                          dither_params=None, roll_angle=0.0, 
-                         subpixel_res=False, prng=None):
+                         subpixel_res=False, aimpt_shift=None,
+                         prng=None):
     """
     Take unconvolved events and create an event file from them. This
     function calls generate_events to do the following:
@@ -945,6 +607,10 @@ def instrument_simulator(input_events, out_file, exp_time, instrument,
     subpixel_res: boolean, optional
         If True, event positions are not randomized within the pixels 
         within which they are detected. Default: False
+    aimpt_shift : array-like, optional
+        A two-float array-like object which shifts the aimpoint on the 
+        detector from the nominal position. Units are in arcseconds.
+        Default: None, which results in no shift from the nominal aimpoint. 
     prng : :class:`~numpy.random.RandomState` object, integer, or None
         A pseudo-random number generator. Typically will only 
         be specified if you have a reason to generate the same 
@@ -954,17 +620,17 @@ def instrument_simulator(input_events, out_file, exp_time, instrument,
     Examples
     --------
     >>> instrument_simulator("sloshing_simput.fits", "sloshing_evt.fits", 
-    ...                      300000.0, "hdxi_3x10", [30., 45.], overwrite=True)
+    ...                      300000.0, "lynx_hdxi", [30., 45.], overwrite=True)
     """
     from soxs.background import add_background_from_file
     if not out_file.endswith(".fits"):
         out_file += ".fits"
-    mylog.info("Making observation of source in %s." % out_file)
+    mylog.info(f"Making observation of source in {out_file}.")
     # Make the source first
     events, event_params = generate_events(input_events, exp_time, instrument, sky_center,
                                            no_dither=no_dither, dither_params=dither_params, 
                                            roll_angle=roll_angle, subpixel_res=subpixel_res, 
-                                           prng=prng)
+                                           aimpt_shift=aimpt_shift, prng=prng)
     # If the user wants backgrounds, either make the background or add an already existing
     # background event file. It may be necessary to reproject events to a new coordinate system.
     if bkgnd_file is None:
@@ -972,17 +638,18 @@ def instrument_simulator(input_events, out_file, exp_time, instrument,
             mylog.info("No backgrounds will be added to this observation.")
         else:
             mylog.info("Adding background events.")
-            bkg_events, _ = make_background(exp_time, instrument, sky_center,
-                                            foreground=foreground, instr_bkgnd=instr_bkgnd, 
-                                            no_dither=no_dither, dither_params=dither_params, 
-                                            ptsrc_bkgnd=ptsrc_bkgnd, prng=prng, 
-                                            subpixel_res=subpixel_res, roll_angle=roll_angle)
+            bkg_events, _ = make_background(
+                exp_time, instrument, sky_center, foreground=foreground,
+                instr_bkgnd=instr_bkgnd, no_dither=no_dither,
+                dither_params=dither_params, ptsrc_bkgnd=ptsrc_bkgnd, prng=prng,
+                subpixel_res=subpixel_res, roll_angle=roll_angle, 
+                aimpt_shift=aimpt_shift)
             for key in events:
                 events[key] = np.concatenate([events[key], bkg_events[key]])
     else:
-        mylog.info("Adding background events from the file %s." % bkgnd_file)
+        mylog.info(f"Adding background events from the file {bkgnd_file}.")
         if not os.path.exists(bkgnd_file):
-            raise IOError("Cannot find the background event file %s!" % bkgnd_file)
+            raise IOError(f"Cannot find the background event file {bkgnd_file}!")
         events = add_background_from_file(events, event_params, bkgnd_file)
     if len(events["energy"]) == 0:
         raise RuntimeError("No events were detected from source or background!!")
@@ -1046,18 +713,18 @@ def simulate_spectrum(spec, instrument, exp_time, out_file,
     ...                        "my_spec.pi", overwrite=True)
     """
     from soxs.events import _write_spectrum
-    from soxs.instrument import RedistributionMatrixFile, \
+    from soxs.response import RedistributionMatrixFile, \
         AuxiliaryResponseFile
     from soxs.spectra import ConvolvedSpectrum
     from soxs.background.foreground import hm_astro_bkgnd
-    from soxs.background.instrument import instrument_backgrounds
     from soxs.background.spectra import BackgroundSpectrum
+    from soxs.background.instrument import InstrumentalBackground
     prng = parse_prng(prng)
     exp_time = parse_value(exp_time, "s")
     try:
         instrument_spec = instrument_registry[instrument]
     except KeyError:
-        raise KeyError("Instrument %s is not in the instrument registry!" % instrument)
+        raise KeyError(f"Instrument {instrument} is not in the instrument registry!")
     if foreground or instr_bkgnd or ptsrc_bkgnd:
         if instrument_spec["grating"]:
             raise NotImplementedError("Backgrounds cannot be included in simulations "
@@ -1069,42 +736,46 @@ def simulate_spectrum(spec, instrument, exp_time, out_file,
         bkgnd_area = np.sqrt(parse_value(bkgnd_area, "arcmin**2"))
     elif spec is None:
         raise RuntimeError("You have specified no source spectrum and no backgrounds!")
-    arf_file = get_response_path(instrument_spec["arf"])
-    rmf_file = get_response_path(instrument_spec["rmf"])
+    arf_file = get_data_file(instrument_spec["arf"])
+    rmf_file = get_data_file(instrument_spec["rmf"])
     arf = AuxiliaryResponseFile(arf_file)
     rmf = RedistributionMatrixFile(rmf_file)
 
-    event_params = {}
-    event_params["RESPFILE"] = os.path.split(rmf.filename)[-1]
-    event_params["ANCRFILE"] = os.path.split(arf.filename)[-1]
-    event_params["TELESCOP"] = rmf.header["TELESCOP"]
-    event_params["INSTRUME"] = rmf.header["INSTRUME"]
-    event_params["MISSION"] = rmf.header.get("MISSION", "")
+    event_params = {"RESPFILE": os.path.split(rmf.filename)[-1],
+                    "ANCRFILE": os.path.split(arf.filename)[-1],
+                    "TELESCOP": rmf.header["TELESCOP"],
+                    "INSTRUME": rmf.header["INSTRUME"],
+                    "MISSION": rmf.header.get("MISSION", "")}
 
     out_spec = np.zeros(rmf.n_ch)
 
     if spec is not None:
-        cspec = ConvolvedSpectrum(spec, arf)
+        cspec = ConvolvedSpectrum.convolve(spec, arf)
         out_spec += rmf.convolve_spectrum(cspec, exp_time, prng=prng)
 
     fov = None if bkgnd_area is None else np.sqrt(bkgnd_area)
 
     if foreground:
         mylog.info("Adding in astrophysical foreground.")
-        cspec_frgnd = ConvolvedSpectrum(hm_astro_bkgnd.to_spectrum(fov), arf)
+        cspec_frgnd = ConvolvedSpectrum.convolve(hm_astro_bkgnd.to_spectrum(fov), arf)
         out_spec += rmf.convolve_spectrum(cspec_frgnd, exp_time, prng=prng)
     if instr_bkgnd and instrument_spec["bkgnd"] is not None:
         mylog.info("Adding in instrumental background.")
-        instr_spec = instrument_backgrounds[instrument_spec["bkgnd"]]
-        cspec_instr = instr_spec.to_scaled_spectrum(fov,
-                                                    instrument_spec["focal_length"])
-        out_spec += rmf.convolve_spectrum(cspec_instr, exp_time, prng=prng)
+        bkgnd_spec = instrument_spec["bkgnd"]
+        # Temporary hack for ACIS-S
+        if "aciss" in instrument_spec["name"]:
+            bkgnd_spec = bkgnd_spec[1]
+        bkgnd_spec = InstrumentalBackground.from_filename(
+            bkgnd_spec[0], bkgnd_spec[1],
+            instrument_spec['focal_length'])
+        out_spec += bkgnd_spec.generate_channel_spectrum(exp_time, bkgnd_area,
+                                                         prng=prng)
     if ptsrc_bkgnd:
         mylog.info("Adding in background from unresolved point-sources.")
         spec_plaw = BackgroundSpectrum.from_powerlaw(1.45, 0.0, 2.0e-7, emin=0.01,
                                                      emax=10.0, nbins=300000)
         spec_plaw.apply_foreground_absorption(nH, model=absorb_model)
-        cspec_plaw = ConvolvedSpectrum(spec_plaw.to_spectrum(fov), arf)
+        cspec_plaw = ConvolvedSpectrum.convolve(spec_plaw.to_spectrum(fov), arf)
         out_spec += rmf.convolve_spectrum(cspec_plaw, exp_time, prng=prng)
 
     bins = (np.arange(rmf.n_ch)+rmf.cmin).astype("int32")

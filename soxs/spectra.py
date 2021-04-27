@@ -5,20 +5,19 @@ import shutil
 import os
 from soxs.utils import soxs_files_path, mylog, \
     parse_prng, parse_value, soxs_cfg, line_width_equiv, \
-    DummyPbar
+    DummyPbar, get_data_file
 from soxs.lib.broaden_lines import broaden_lines
 from soxs.constants import erg_per_keV, hc, \
     cosmic_elem, metal_elem, atomic_weights, clight, \
-    m_u, elem_names, sigma_to_fwhm, abund_tables, sqrt2pi
+    m_u, elem_names, sigma_to_fwhm, abund_tables, sqrt2pi, \
+    default_apec_vers
 import astropy.io.fits as pyfits
 import astropy.units as u
 import h5py
 from scipy.interpolate import InterpolatedUnivariateSpline
-from soxs.instrument import AuxiliaryResponseFile
 from astropy.modeling.functional_models import \
     Gaussian1D
-import glob
-from tqdm import tqdm
+from tqdm.auto import tqdm
 
 
 class Energies(u.Quantity):
@@ -41,7 +40,7 @@ def _generate_energies(spec, t_exp, rate, prng, quiet=False):
     return e
 
 
-class Spectrum(object):
+class Spectrum:
     _units = "photon/(cm**2*s*keV)"
 
     def __init__(self, ebins, flux):
@@ -49,13 +48,13 @@ class Spectrum(object):
         self.emid = 0.5*(self.ebins[1:]+self.ebins[:-1])
         self.flux = u.Quantity(flux, self._units)
         self.nbins = len(self.emid)
-        self.de = self.ebins[1]-self.ebins[0]
+        self.de = np.diff(self.ebins)
         self._compute_total_flux()
 
     def _compute_total_flux(self):
-        self.total_flux = self.flux.sum()*self.de
-        self.total_energy_flux = (self.flux*self.emid.to("erg")).sum()*self.de/(1.0*u.photon)
-        cumspec = np.cumsum(self.flux.value*self.de.value)
+        self.total_flux = (self.flux*self.de).sum()
+        self.total_energy_flux = (self.flux*self.emid.to("erg")*self.de).sum()/(1.0*u.photon)
+        cumspec = np.cumsum((self.flux*self.de).value)
         cumspec = np.insert(cumspec, 0, 0.0)
         cumspec /= cumspec[-1]
         self.cumspec = cumspec
@@ -72,8 +71,8 @@ class Spectrum(object):
         return Spectrum(self.ebins, self.flux+other.flux)
 
     def __mul__(self, other):
-        if isinstance(other, AuxiliaryResponseFile):
-            return ConvolvedSpectrum(self, other)
+        if hasattr(other, "eff_area"):
+            return ConvolvedSpectrum.convolve(self, other)
         else:
             return Spectrum(self.ebins, other*self.flux)
 
@@ -117,8 +116,8 @@ class Spectrum(object):
         emin = parse_value(emin, "keV")
         emax = parse_value(emax, "keV")
         range = np.logical_and(self.emid.value >= emin, self.emid.value <= emax)
-        pflux = self.flux[range].sum()*self.de
-        eflux = (self.flux*self.emid.to("erg"))[range].sum()*self.de/(1.0*u.photon)
+        pflux = (self.flux*self.de)[range].sum()
+        eflux = (self.flux*self.emid.to("erg")*self.de)[range].sum()/(1.0*u.photon)
         return pflux, eflux
 
     @classmethod
@@ -173,12 +172,6 @@ class Spectrum(object):
         return cls._from_xspec(xspec_in, emin, emax, nbins)
 
     @classmethod
-    def from_xspec(cls, model_string, params, emin, emax, nbins):
-        mylog.warning("The 'from_xspec' method has been deprecated: "
-                      "use 'from_xspec_model' instead.")
-        cls.from_xspec_model(model_string, params, emin, emax, nbins)
-
-    @classmethod
     def _from_xspec(cls, xspec_in, emin, emax, nbins):
         emin = parse_value(emin, "keV")
         emax = parse_value(emax, "keV")
@@ -201,7 +194,7 @@ class Spectrum(object):
         lines = f_s.readlines()
         f_s.close()
         ebins = np.array(lines[0].split()).astype("float64")
-        de = np.diff(ebins)[0]
+        de = np.diff(ebins)
         flux = np.array(lines[1].split()).astype("float64")/de
         os.chdir(curdir)
         shutil.rmtree(tmpdir)
@@ -295,6 +288,16 @@ class Spectrum(object):
         flux = const_flux*np.ones(nbins)
         return cls(ebins, flux)
 
+    def _new_spec_from_band(self, emin, emax):
+        emin = parse_value(emin, "keV")
+        emax = parse_value(emax, 'keV')
+        band = np.logical_and(self.ebins.value >= emin,
+                              self.ebins.value <= emax)
+        idxs = np.where(band)[0]
+        ebins = self.ebins.value[idxs]
+        flux = self.flux.value[idxs[:-1]]
+        return ebins, flux
+
     def new_spec_from_band(self, emin, emax):
         """
         Create a new :class:`~soxs.spectra.Spectrum` object
@@ -308,13 +311,7 @@ class Spectrum(object):
         emax : float, (value, unit) tuple, or :class:`~astropy.units.Quantity`
             The maximum energy of the band in keV.
         """
-        emin = parse_value(emin, "keV")
-        emax = parse_value(emax, 'keV')
-        band = np.logical_and(self.ebins.value >= emin, 
-                              self.ebins.value <= emax)
-        idxs = np.where(band)[0]
-        ebins = self.ebins.value[idxs]
-        flux = self.flux.value[idxs[:-1]]
+        ebins, flux = self._new_spec_from_band(emin, emax)
         return Spectrum(ebins, flux)
 
     def rescale_flux(self, new_flux, emin=None, emax=None, flux_type="photons"):
@@ -347,9 +344,9 @@ class Spectrum(object):
         emax = parse_value(emax, 'keV')
         idxs = np.logical_and(self.emid.value >= emin, self.emid.value <= emax)
         if flux_type == "photons":
-            f = self.flux[idxs].sum()*self.de
+            f = (self.flux*self.de)[idxs].sum()
         elif flux_type == "energy":
-            f = (self.flux*self.emid.to("erg"))[idxs].sum()*self.de
+            f = (self.flux*self.emid.to("erg")*self.de)[idxs].sum()
         self.flux *= new_flux/f.value
         self._compute_total_flux()
 
@@ -366,8 +363,8 @@ class Spectrum(object):
             file with the same name. Default: False
         """
         if os.path.exists(specfile) and not overwrite:
-            raise IOError("File %s exists and overwrite=False!" % specfile)
-        header = "Energy\tFlux\nkeV\t%s" % self._units
+            raise IOError(f"File {specfile} exists and overwrite=False!")
+        header = f"Energy\tFlux\nkeV\t{self._units}"
         np.savetxt(specfile, np.transpose([self.emid, self.flux]), 
                    delimiter="\t", header=header)
 
@@ -583,7 +580,7 @@ class Spectrum(object):
         return fig, ax
 
 
-class ApecGenerator(object):
+class ApecGenerator:
     r"""
     Initialize a thermal gas emission model from the 
     AtomDB APEC tables available at http://www.atomdb.org. 
@@ -637,7 +634,7 @@ class ApecGenerator(object):
         not supplied with SOXS but must be downloaded separately, in
         which case the *apec_root* parameter must also be set to their
         location. Default: False
-
+        
     Examples
     --------
     >>> apec_model = ApecGenerator(0.05, 50.0, 1000, apec_vers="3.0.3",
@@ -647,14 +644,8 @@ class ApecGenerator(object):
                  apec_vers=None, broadening=True, nolines=False,
                  abund_table=None, nei=False):
         if apec_vers is None:
-            filedir = os.path.join(os.path.dirname(__file__), 'files')
-            cfile = glob.glob("%s/apec_*_coco.fits" % filedir)[0]
-            apec_vers = cfile.split("/")[-1].split("_")[1][1:]
-        mylog.info("Using APEC version %s." % apec_vers)
-        if nei and apec_root is None:
-            raise RuntimeError("The NEI APEC tables are not supplied with "
-                               "SOXS! Download them from http://www.atomdb.org "
-                               "and set 'apec_root' to their location.")
+            apec_vers = default_apec_vers
+        mylog.info(f"Using APEC version {apec_vers}.")
         if nei and var_elem is None:
             raise RuntimeError("For NEI spectra, you must specify which elements "
                                "you want to vary using the 'var_elem' argument!")
@@ -667,41 +658,39 @@ class ApecGenerator(object):
         self.ebins = np.linspace(self.emin, self.emax, nbins+1)
         self.de = np.diff(self.ebins)
         self.emid = 0.5*(self.ebins[1:]+self.ebins[:-1])
-        if apec_root is None:
-            apec_root = soxs_files_path
         if nei:
             neistr = "_nei"
             ftype = "comp"
         else:
             neistr = ""
             ftype = "coco"
-        self.cocofile = os.path.join(apec_root, "apec_v%s%s_%s.fits" % (apec_vers, neistr, ftype))
-        self.linefile = os.path.join(apec_root, "apec_v%s%s_line.fits" % (apec_vers, neistr))
+        cocofile = f"apec_v{apec_vers}{neistr}_{ftype}.fits"
+        linefile = f"apec_v{apec_vers}{neistr}_line.fits"
+        if apec_root is None:
+            self.cocofile = get_data_file(cocofile)
+            self.linefile = get_data_file(linefile)
+        else:
+            self.cocofile = os.path.join(apec_root, cocofile)
+            self.linefile = os.path.join(apec_root, linefile)
         if not os.path.exists(self.cocofile) or not os.path.exists(self.linefile):
-            raise IOError("Cannot find the APEC files!\n %s\n, %s" % (self.cocofile,
-                                                                      self.linefile))
-        mylog.info("Using %s for generating spectral lines." % os.path.split(self.linefile)[-1])
-        mylog.info("Using %s for generating the continuum." % os.path.split(self.cocofile)[-1])
+            raise IOError(f"Cannot find the APEC files!\n {self.cocofile}\n, "
+                          f"{self.linefile}")
+        mylog.info(f"Using {cocofile} for generating spectral lines.")
+        mylog.info(f"Using {linefile} for generating the continuum.")
         self.nolines = nolines
         self.wvbins = hc/self.ebins[::-1]
         self.broadening = broadening
-        try:
-            self.line_handle = pyfits.open(self.linefile)
-        except IOError:
-            raise IOError("Line file %s does not exist" % self.linefile)
-        try:
-            self.coco_handle = pyfits.open(self.cocofile)
-        except IOError:
-            raise IOError("Continuum file %s does not exist" % self.cocofile)
+        self.line_handle = pyfits.open(self.linefile)
+        self.coco_handle = pyfits.open(self.cocofile)
+        self.nT = self.line_handle[1].data.shape[0]
         self.Tvals = self.line_handle[1].data.field("kT")
-        self.nT = len(self.Tvals)
         self.dTvals = np.diff(self.Tvals)
         self.minlam = self.wvbins.min()
         self.maxlam = self.wvbins.max()
         self.var_elem_names = []
         self.var_ion_names = []
         if var_elem is None:
-            self.var_elem = np.empty((0,1), dtype='int')
+            self.var_elem = np.empty((0, 1), dtype='int')
         else:
             self.var_elem = []
             if len(var_elem) != len(set(var_elem)):
@@ -989,7 +978,18 @@ def get_tbabs_absorb(e, nH):
 class ConvolvedSpectrum(Spectrum):
     _units = "photon/(s*keV)"
 
-    def __init__(self, spectrum, arf):
+    def __init__(self, ebins, flux, arf):
+        from numbers import Number
+        from soxs.response import AuxiliaryResponseFile, FlatResponse
+        super(ConvolvedSpectrum, self).__init__(ebins, flux)
+        if isinstance(arf, Number):
+            arf = FlatResponse(ebins[0], ebins[-1], arf, ebins.size-1)
+        elif isinstance(arf, str):
+            arf = AuxiliaryResponseFile(arf)
+        self.arf = arf
+
+    @classmethod
+    def convolve(cls, spectrum, arf):
         """
         Generate a convolved spectrum by convolving a spectrum with an
         ARF.
@@ -1001,12 +1001,28 @@ class ConvolvedSpectrum(Spectrum):
         arf : string or :class:`~soxs.instrument.AuxiliaryResponseFile`
             The ARF to use in the convolution.
         """
+        from soxs.response import AuxiliaryResponseFile
         if not isinstance(arf, AuxiliaryResponseFile):
             arf = AuxiliaryResponseFile(arf)
-        self.arf = arf
         earea = arf.interpolate_area(spectrum.emid.value)
         rate = spectrum.flux * earea
-        super(ConvolvedSpectrum, self).__init__(spectrum.ebins, rate)
+        return cls(spectrum.ebins, rate, arf)
+
+    def new_spec_from_band(self, emin, emax):
+        """
+        Create a new :class:`~soxs.spectra.ConvolvedSpectrum` object
+        from a subset of an existing one defined by a particular
+        energy band.
+
+        Parameters
+        ----------
+        emin : float, (value, unit) tuple, or :class:`~astropy.units.Quantity`
+            The minimum energy of the band in keV.
+        emax : float, (value, unit) tuple, or :class:`~astropy.units.Quantity`
+            The maximum energy of the band in keV.
+        """
+        ebins, flux = self._new_spec_from_band(emin, emax)
+        return ConvolvedSpectrum(ebins, flux, self.arf)
 
     def deconvolve(self):
         """
@@ -1048,31 +1064,6 @@ class ConvolvedSpectrum(Spectrum):
 
     def apply_foreground_absorption(self, nH, model="wabs"):
         raise NotImplementedError
-
-    def rescale_flux(self, new_flux, emin=None, emax=None, flux_type="photons"):
-        """
-        Rescale the flux of the convolved spectrum, optionally using 
-        a specific energy band.
-
-        Parameters
-        ----------
-        new_flux : float
-            The new flux in units of photons/s/cm**2.
-        emin : float, (value, unit) tuple, or :class:`~astropy.units.Quantity`, optional
-            The minimum energy of the band to consider, 
-            in keV. Default: Use the minimum energy of 
-            the entire spectrum.
-        emax : float, (value, unit) tuple, or :class:`~astropy.units.Quantity`, optional
-            The maximum energy of the band to consider, 
-            in keV. Default: Use the maximum energy of 
-            the entire spectrum.
-        flux_type : string, optional
-            The units of the flux to use in the rescaling:
-                "photons": photons/s
-                "energy": erg/s
-        """
-        super(ConvolvedSpectrum, self).rescale_flux(new_flux, emin=emin, emax=emax, 
-                                                    flux_type=flux_type)
 
     @classmethod
     def from_constant(cls, const_flux, emin=0.01, emax=50.0, nbins=10000):

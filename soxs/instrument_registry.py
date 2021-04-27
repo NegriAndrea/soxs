@@ -1,32 +1,19 @@
 import json
-from soxs.utils import mylog, parse_value, \
-    issue_deprecation_warning
+from soxs.utils import mylog, parse_value, PoochHandle
 import os
 from copy import deepcopy
 
 # The Instrument Registry
 
 
-class InstrumentRegistry(object):
+class InstrumentRegistry:
     def __init__(self):
-        self.dep_map = {}
         self.registry = {}
 
-    def _complain_old(self, key):
-        msg = "Instrument '%s' has been replaced with " % key
-        msg += "instrument '%s' and is deprecated. " % self.dep_map[key]
-        msg += "Please edit your scripts/notebooks accordingly."
-        issue_deprecation_warning(msg)
-
     def __getitem__(self, key):
-        if key in self.dep_map:
-            self._complain_old(key)
-            key = self.dep_map[key]
         return self.registry[key]
 
     def __setitem__(self, key, value):
-        if "dep_name" in value:
-            self.dep_map[value["dep_name"]] = value["name"]
         self.registry[key] = value
 
     def keys(self):
@@ -36,16 +23,50 @@ class InstrumentRegistry(object):
         return self.registry.items()
 
     def __contains__(self, item):
-        if item in self.dep_map:
-            self._complain_old(item)
-            return True
         return item in self.registry
 
     def get(self, key, default=None):
         return self.registry.get(key, default)
 
-    def set(self, key, value, default=None):
-        self.registry.set(key, value, default)
+    def fetch_files(self, key, loc=None):
+        """
+        A handy method to fetch ARF, RMF, background,
+        and PSF files to a location of one's choice.
+        Files are only actually downloaded if they are 
+        not present already.
+
+        Parameters
+        ----------
+        key : string
+            The instrument specification to download
+            the files for.
+        loc : string, optional
+            The path to download the files to. If not 
+            specified, it will download them to the 
+            current working directory.
+        """
+        inst_spec = self[key]
+        if loc is None:
+            loc = os.getcwd()
+        dog = PoochHandle(cache_dir=loc)
+        log_msg = f"Downloading %s \"%s\" for instrument \"{key}\"."
+        fns = [inst_spec['arf'], inst_spec['rmf']]
+        logs = ["ARF", "RMF"]
+        if inst_spec['bkgnd'] is not None:
+            bkgnd = inst_spec['bkgnd'][0]
+            if isinstance(bkgnd, list):
+                for b in inst_spec['bkgnd']:
+                    fns.append(b[0])
+            else:
+                fns.append(bkgnd)
+            logs.append("instrumental background model")
+        if inst_spec['psf'] is not None:
+            if "image" in inst_spec['psf'][0]:
+                fns.append(inst_spec['psf'][1])
+                logs.append("PSF model")
+        for fn, log in zip(fns, logs):
+            mylog.info(log_msg % (log, fn))
+            dog.fetch(fn)
 
 
 instrument_registry = InstrumentRegistry()
@@ -57,60 +78,67 @@ instrument_registry = InstrumentRegistry()
 instrument_registry["lynx_hdxi"] = {"name": "lynx_hdxi",
                                     "arf": "xrs_hdxi_3x10.arf",
                                     "rmf": "xrs_hdxi.rmf",
-                                    "bkgnd": "acisi",
+                                    "bkgnd": ["lynx_hdxi_particle_bkgnd.pha", 1.0],
                                     "fov": 22.0,
                                     "num_pixels": 4096,
                                     "aimpt_coords": [0.0, 0.0],
-                                    "chips": None,
+                                    "chips": [["Box", 0, 0, 4096, 4096]],
                                     "focal_length": 10.0,
                                     "dither": True,
-                                    "psf": ["gaussian", 0.5],
+                                    "psf": ["image", "chandra_psf.fits", 6],
                                     "imaging": True,
-                                    "grating": False,
-                                    "dep_name": "hdxi"}
+                                    "grating": False}
 
 # Micro-calorimeter
 
 instrument_registry["lynx_lxm"] = {"name": "lynx_lxm",
                                    "arf": "xrs_mucal_3x10_3.0eV.arf",
                                    "rmf": "xrs_mucal_3.0eV.rmf",
-                                   "bkgnd": "mucal",
+                                   "bkgnd": [
+                                       "lynx_lxm_particle_bkgnd.pha",
+                                       1.0
+                                   ],
                                    "fov": 5.0,
                                    "num_pixels": 300,
                                    "aimpt_coords": [0.0, 0.0],
-                                   "chips": None,
+                                   "chips": [["Box", 0, 0, 300, 300]],
                                    "focal_length": 10.0,
                                    "dither": True,
-                                   "psf": ["gaussian", 0.5],
+                                   "psf": ["image", "chandra_psf.fits", 6],
                                    "imaging": True,
-                                   "grating": False, 
-                                   "dep_name": "mucal"}
+                                   "grating": False}
 
 instrument_registry["lynx_lxm_enh"] = {"name": "lynx_lxm_enh",
                                        "arf": "xrs_mucal_3x10_1.5eV.arf",
                                        "rmf": "xrs_mucal_1.5eV.rmf",
-                                       "bkgnd": "mucal",
+                                       "bkgnd": [
+                                           "lynx_lxm_enh_particle_bkgnd.pha",
+                                           1.0
+                                       ],
                                        "fov": 1.0,
                                        "num_pixels": 120,
                                        "aimpt_coords": [0.0, 0.0], 
-                                       "chips": None,
+                                       "chips": [["Box", 0, 0, 120, 120]],
                                        "focal_length": 10.0,
                                        "dither": True,
-                                       "psf": ["gaussian", 0.5],
+                                       "psf": ["image", "chandra_psf.fits", 6],
                                        "imaging": True,
                                        "grating": False}
 
 instrument_registry["lynx_lxm_ultra"] = {"name": "lynx_lxm_ultra",
                                          "arf": "xrs_mucal_3x10_0.3eV.arf",
                                          "rmf": "xrs_mucal_0.3eV.rmf",
-                                         "bkgnd": "mucal",
+                                         "bkgnd": [
+                                             "lynx_lxm_ultra_particle_bkgnd.pha",
+                                             1.0
+                                         ],
                                          "fov": 1.0,
                                          "num_pixels": 60,
                                          "aimpt_coords": [0.0, 0.0],
-                                         "chips": None,
+                                         "chips": [["Box", 0, 0, 60, 60]],
                                          "focal_length": 10.0,
                                          "dither": True,
-                                         "psf": ["gaussian", 0.5],
+                                         "psf": ["image", "chandra_psf.fits", 6],
                                          "imaging": True,
                                          "grating": False}
 
@@ -130,9 +158,11 @@ instrument_registry["lynx_xgs"] = {"name": "lynx_xgs",
 # WFI
 
 instrument_registry["athena_wfi"] = {"name": "athena_wfi",
-                                     "arf": "athena_wfi_15row_20171107_wo_filter_OnAxis.arf",
-                                     "rmf": "athena_wfi_baseline.rmf",
-                                     "bkgnd": "athena_wfi",
+                                     "arf": "athena_sixte_wfi_wo_filter_v20190122.arf",
+                                     "rmf": "athena_wfi_sixte_v20150504.rmf",
+                                     "bkgnd": [ 
+                                         "sixte_wfi_particle_bkg_20190829.pha",
+                                         79552.92570677],
                                      "fov": 40.147153,
                                      "num_pixels": 1078,
                                      "aimpt_coords": [53.69, -53.69],
@@ -141,27 +171,33 @@ instrument_registry["athena_wfi"] = {"name": "athena_wfi",
                                                ["Box", -283, 283, 512, 512],
                                                ["Box", 283, 283, 512, 512]],
                                      "focal_length": 12.0,
-                                     "dither": False,
-                                     "psf": ["gaussian", 5.0],
+                                     "dither": True,
+                                     "psf": ["multi_image", "athena_psf_15row.fits"],
                                      "imaging": True,
                                      "grating": False}
 
 # XIFU
 
 instrument_registry["athena_xifu"] = {"name": "athena_xifu",
-                                      "arf": "XIFU_CC_BASELINECONF_2018_10_10.arf",
+                                      "arf": "sixte_xifu_cc_baselineconf_20180821.arf",
                                       "rmf": "XIFU_CC_BASELINECONF_2018_10_10.rmf",
-                                      "bkgnd": "athena_xifu",
+                                      "bkgnd": [
+                                          "xifu_nxb_20181209.pha",
+                                          79552.92570677
+                                      ],
                                       "fov": 5.991992621478149,
                                       "num_pixels": 84,
                                       "aimpt_coords": [0.0, 0.0],
-                                      "chips": [["Polygon", 
+                                      "chips": [["Polygon",
                                                  [-33, 0, 33, 33, 0, -33],
                                                  [20, 38, 20, -20, -38, -20]]],
                                       "focal_length": 12.0,
-                                      "dither": False,
-                                      "psf": ["gaussian", 5.0],
-                                      "imaging": True, 
+                                      "dither": True,
+                                      "psf": [
+                                          "multi_image",
+                                          "athena_psf_15row.fits"
+                                      ],
+                                      "imaging": True,
                                       "grating": False}
 
 ## Chandra
@@ -169,11 +205,14 @@ instrument_registry["athena_xifu"] = {"name": "athena_xifu",
 # ACIS-I, Cycle 0 and 20
 
 for cycle in [0, 22]:
-    name = "chandra_acisi_cy%d" % cycle
+    name = f"chandra_acisi_cy{cycle}"
     instrument_registry[name] = {"name": name, 
-                                 "arf": "acisi_aimpt_cy%d.arf" % cycle,
-                                 "rmf": "acisi_aimpt_cy%d.rmf" % cycle,
-                                 "bkgnd": "acisi",
+                                 "arf": f"acisi_aimpt_cy{cycle}.arf",
+                                 "rmf": f"acisi_aimpt_cy{cycle}.rmf",
+                                 "bkgnd": [
+                                     f"chandra_acisi_cy{cycle}_particle_bkgnd.pha", 
+                                     1.0
+                                 ],
                                  "fov": 20.008,
                                  "num_pixels": 2440,
                                  "aimpt_coords": [86.0, 57.0],
@@ -181,23 +220,33 @@ for cycle in [0, 22]:
                                            ["Box", 523, -523, 1024, 1024],
                                            ["Box", -523, 523, 1024, 1024],
                                            ["Box", 523, 523, 1024, 1024]],
-                                 "psf": ["gaussian", 0.5],
+                                 "psf": ["multi_image", "chandra_psf.fits"],
                                  "focal_length": 10.0,
                                  "dither": True,
                                  "imaging": True,
-                                 "grating": False,
-                                 "dep_name": "acisi_cy%d" % cycle}
+                                 "grating": False}
 
 # ACIS-S, Cycle 0 and 22
 
 for cycle in [0, 22]:
-    name = "chandra_aciss_cy%d" % cycle
+    name = f"chandra_aciss_cy{cycle}"
     instrument_registry[name] = {"name": name,
-                                 "arf": "aciss_aimpt_cy%d.arf" % cycle,
-                                 "rmf": "aciss_aimpt_cy%d.rmf" % cycle,
-                                 "bkgnd": ["acisi", "aciss",
-                                           "acisi", "aciss",
-                                           "acisi", "acisi"],
+                                 "arf": f"aciss_aimpt_cy{cycle}.arf",
+                                 "rmf": f"aciss_aimpt_cy{cycle}.rmf",
+                                 "bkgnd": [
+                                     [f"chandra_aciss_cy{cycle}_fi_particle_bkgnd.pha",
+                                      1.0],
+                                     [f"chandra_aciss_cy{cycle}_bi_particle_bkgnd.pha",
+                                      1.0],
+                                     [f"chandra_aciss_cy{cycle}_fi_particle_bkgnd.pha",
+                                      1.0],
+                                     [f"chandra_aciss_cy{cycle}_bi_particle_bkgnd.pha",
+                                      1.0],
+                                     [f"chandra_aciss_cy{cycle}_fi_particle_bkgnd.pha",
+                                      1.0],
+                                     [f"chandra_aciss_cy{cycle}_fi_particle_bkgnd.pha",
+                                      1.0]
+                                 ],
                                  "fov": 50.02,
                                  "num_pixels": 6100,
                                  "aimpt_coords": [206.0, 0.0],
@@ -207,32 +256,29 @@ for cycle in [0, 22]:
                                            ["Box", 521, 0, 1024, 1024],
                                            ["Box", 1563, 0, 1024, 1024],
                                            ["Box", 2605, 0, 1024, 1024]],
-                                 "psf": ["gaussian", 0.5],
+                                 "psf": ["multi_image", "chandra_psf.fits"],
                                  "focal_length": 10.0,
                                  "dither": True,
-                                 "imaging": True, 
-                                 "grating": False,
-                                 "dep_name": "aciss_cy%d" % cycle}
+                                 "imaging": True,
+                                 "grating": False}
 
 
-# ACIS-S, Cycle 0 and 19 HETG
+# ACIS-S, Cycle 0 and 19 HETG (for spectra only)
 
 orders = {"p1": 1, "m1": -1}
 
 for energy in ["meg", "heg"]:
     for order in ["p1", "m1"]:
-        for cycle in [0, 20]:
-            dep_name = "aciss_%s_%s_cy%d" % (energy, order, cycle)
-            name = "chandra_" + dep_name
-            resp_name = "chandra_aciss_%s%d_cy%d" % (energy, orders[order], cycle)
+        for cycle in [0, 22]:
+            name = f"chandra_aciss_{energy}_{order}_cy{cycle}"
+            resp_name = f"chandra_aciss_{energy}{orders[order]}_cy{cycle}"
             instrument_registry[name] = {"name": name,
-                                         "arf": "%s.garf" % resp_name,
-                                         "rmf": "%s.grmf" % resp_name,
+                                         "arf": f"{resp_name}.garf",
+                                         "rmf": f"{resp_name}.grmf",
                                          "bkgnd": None,
                                          "focal_length": 10.0,
                                          "imaging": False,
-                                         "grating": True,
-                                         "dep_name": dep_name}
+                                         "grating": True}
 
 ## Hitomi
 
@@ -241,33 +287,55 @@ for energy in ["meg", "heg"]:
 instrument_registry["xrism_resolve"] = {"name": "xrism_resolve",
                                         "arf": "xarm_res_flt_pa_20170818.arf",
                                         "rmf": "xarm_res_h5ev_20170818.rmf",
-                                        "bkgnd": "hitomi_sxs",
+                                        "bkgnd": [
+                                            "sxs_nxb_4ev_20110211_1Gs.pha",
+                                            9.130329009932256
+                                        ],
                                         "num_pixels": 6,
                                         "fov": 3.06450576,
                                         "aimpt_coords": [0.0, 0.0],
-                                        "chips": None,
+                                        "chips": [["Box", 0, 0, 6, 6]],
                                         "focal_length": 5.6,
                                         "dither": False,
-                                        "psf": ["gaussian", 72.0],
+                                        "psf": ["multi_image",
+                                                "sxs_psfimage_20140618.fits"],
                                         "imaging": True,
-                                        "grating": False,
-                                        "dep_name": "hitomi_sxs"}
+                                        "grating": False}
 
 ## AXIS
 
 instrument_registry["axis"] = {"name": "axis",
                                "arf": "axis-31jan18.arf",
                                "rmf": "axis-31jan18.rmf",
-                               "bkgnd": "axis",
-                               "num_pixels": 5200,
-                               "fov": 15.0,
+                               "bkgnd": [
+                                   "axis_nxb_leo_fov_10Msec_20180205.pha",
+                                   225.0
+                               ],
+                               "num_pixels": 4000,
+                               "fov": 24.0,
                                "aimpt_coords": [0.0, 0.0],
-                               "chips": None,
+                               "chips": [["Box", 0, 0, 4000, 4000]],
                                "focal_length": 9.5,
-                               "dither": False,
-                               "psf": ["gaussian", 0.3],
+                               "dither": True,
+                               "psf": ["multi_image", "axis_psf_gauss_v1.fits"],
                                "imaging": True,
                                "grating": False}
+
+## STAR-X
+
+instrument_registry["star-x"] = {"name": "star-x",
+                                 "arf": "starx_2020-11-26_fov_avg.arf",
+                                 "rmf": "starx.rmf",
+                                 "bkgnd": None,
+                                 "num_pixels": 3600,
+                                 "fov": 60.0,
+                                 "aimpt_coords": [0.0, 0.0],
+                                 "chips": [["Box", 0, 0, 3600, 3600]],
+                                 "focal_length": 4.5,
+                                 "dither": True,
+                                 "psf": ["gaussian", 3.0],
+                                 "imaging": True,
+                                 "grating": False}
 
 
 def add_instrument_to_registry(inst_spec):
@@ -290,13 +358,13 @@ def add_instrument_to_registry(inst_spec):
     ...     "name": "lynx_hdxi", # The short name of the instrument
     ...     "arf": "xrs_hdxi_3x10.arf", # The file containing the ARF
     ...     "rmf": "xrs_hdxi.rmf", # The file containing the RMF
-    ...     "bkgnd": "acisi", # The name of the particle background
+    ...     "bkgnd": ["lynx_hdxi_particle_bkgnd.pha", 1.0], # The name of the particle background file and the area of extraction
     ...     "fov": 20.0, # The field of view in arcminutes
     ...     "focal_length": 10.0, # The focal length in meters
     ...     "num_pixels": 4096, # The number of pixels on a side in the FOV
     ...     "dither": True, # Whether or not to dither the instrument
-    ...     "psf": ["gaussian", 0.5], # The type of PSF and its HPD
-    ...     "chips": None, # The specification for the chips
+    ...     "psf": ["image", "chandra_psf.fits", 6], # The type of PSF and associated parameters
+    ...     "chips": [["Box", 0, 0, 4096, 4096]], # The specification for the chips
     ...     "aimpt_coords": [0.0, 0.0], # The detector coordinates of the aimpoint
     ...     "imaging": True # Whether or not this is a imaging instrument
     ...     "grating": False # Whether or not this is a grating instrument
@@ -305,54 +373,43 @@ def add_instrument_to_registry(inst_spec):
     if isinstance(inst_spec, dict):
         inst = inst_spec
     elif os.path.exists(inst_spec):
-        f = open(inst_spec, "r")
-        inst = json.load(f)
-        f.close()
+        with open(inst_spec, "r") as f:
+            inst = json.load(f)
     name = inst["name"]
     if name in instrument_registry:
-        raise KeyError("The instrument with name %s is already in the registry! Assign a different name!" % name)
-    # Catch older JSON files which don't distinguish between imagings and non-imagings
+        raise KeyError(f"The instrument with name {name} is already in the "
+                       f"registry! Assign a different name!")
+    # Catch older JSON files which don't distinguish between imagings
+    # and non-imagings
     if "imaging" not in inst:
-        mylog.warning("Instrument specifications must now include an 'imaging' item, which "
-                      "determines whether or not this instrument specification supports "
-                      "imaging. Default is True.")
+        mylog.warning("Instrument specifications must now include an 'imaging' "
+                      "item, which determines whether or not this instrument "
+                      "specification supports imaging. Default is True.")
         inst["imaging"] = True
     if "grating" not in inst:
-        mylog.warning("Instrument specifications must now include an 'grating' item, which "
-                      "determines whether or not this instrument specification corresponds "
-                      "to a gratings instrument. Default is False.")
+        mylog.warning("Instrument specifications must now include an 'grating' "
+                      "item, which determines whether or not this instrument "
+                      "specification corresponds to a gratings instrument. "
+                      "Default is False.")
         inst["grating"] = False
     if inst["grating"] and inst["imaging"]:
-        raise RuntimeError("Currently, gratings instrument specifications cannot have "
-                           "'imaging' == True!")
+        raise RuntimeError("Currently, gratings instrument specifications cannot "
+                           "have 'imaging' == True!")
     if inst['imaging']:
-        # Catch older JSON files without chip definitions
-        if "chips" not in inst:
-            mylog.warning("Instrument specifications must now include a 'chips' item, which details "
-                          "the layout of the chips if there are more that one. Assuming None for "
-                          "one chip that covers the entire field of view.")
-            inst["chips"] = None
-        # Catch older JSON files without aimpoint coordinates
-        if "aimpt_coords" not in inst:
-            mylog.warning("Instrument specifications must now include a 'aimpt_coords' item, which "
-                          "details the position in detector coordinates of the nominal aimpoint. "
-                          "Assuming [0.0, 0.0].")
-            inst["aimpt_coords"] = [0.0, 0.0]
         default_set = {"name", "arf", "rmf", "bkgnd", "fov", "chips",
                        "aimpt_coords", "focal_length", "num_pixels",
                        "dither", "psf", "imaging", "grating"}
     else:
-        default_set = {"name", "arf", "rmf", "bkgnd", "focal_length", "imaging", "grating"}
+        default_set = {"name", "arf", "rmf", "bkgnd", "focal_length", 
+                       "imaging", "grating"}
     my_keys = set(inst.keys())
-    # Don't check things we don't need
-    if "dep_name" in my_keys:
-        my_keys.remove("dep_name")
     if my_keys != default_set:
         missing = default_set.difference(my_keys)
-        raise RuntimeError("One or more items is missing from the instrument specification!\n"
-                           "Items needed: %s" % missing)
+        raise RuntimeError(f"One or more items is missing from the instrument "
+                           f"specification!\nItems needed: {missing}")
     instrument_registry[name] = inst
-    mylog.debug("The %s instrument specification has been added to the instrument registry." % name)
+    mylog.debug(f"The {name} instrument specification has been added "
+                f"to the instrument registry.")
     return name
 
 
@@ -362,7 +419,7 @@ def get_instrument_from_registry(name):
     corresponding to *name*.
     """
     if name not in instrument_registry:
-        raise KeyError("Instrument '%s' not in registry!" % name)
+        raise KeyError(f"Instrument '{name}' not in registry!")
     return deepcopy(instrument_registry[name])
 
 
@@ -371,9 +428,9 @@ def show_instrument_registry():
     Print the contents of the instrument registry.
     """
     for name, spec in instrument_registry.items():
-        print("Instrument: %s" % name)
+        print(f"Instrument: {name}")
         for k, v in spec.items():
-            print("    %s: %s" % (k, v))
+            print(f"    {k}: {v}")
 
 
 def write_instrument_json(inst_name, filename):
@@ -390,9 +447,8 @@ def write_instrument_json(inst_name, filename):
         The filename to write to.
     """
     inst_dict = instrument_registry[inst_name]
-    fp = open(filename, 'w')
-    json.dump(inst_dict, fp, indent=4)
-    fp.close()
+    with open(filename, 'w') as f:
+        json.dump(inst_dict, f, indent=4)
 
 
 def make_simple_instrument(base_inst, new_inst, fov, num_pixels,
@@ -428,7 +484,7 @@ def make_simple_instrument(base_inst, new_inst, fov, num_pixels,
         raise RuntimeError("make_simple_instrument only works with "
                            "imaging instruments!")
     sq_inst["name"] = new_inst
-    sq_inst["chips"] = None
+    sq_inst["chips"] = [["Box", 0, 0, num_pixels, num_pixels]]
     sq_inst["fov"] = parse_value(fov, "arcmin")
     sq_inst["num_pixels"] = num_pixels
     if no_bkgnd:

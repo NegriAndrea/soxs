@@ -3,6 +3,65 @@
 ChangeLog
 =========
 
+Version 3.0.0
+-------------
+
+This major version update of SOXS contains new features and optimizations. 
+**NOTE: there are some backwards-incompatible changes in this release.**
+
+* SOXS now supports two new PSF model types, ``"image"``, which uses a single
+  FITS image for the PSF model, and ``"multi_image"``, which can use a number
+  of FITS images corresponding to different incident photon energies and 
+  different off-axis angles. See :ref:`psf-models` for details.
+* SOXS now uses standard PHA files with FITS tables of channel and count rate
+  to create instrumental/particle background. See :ref:`instr-bkgnd` for more 
+  details. 
+* SOXS now supports "spectrum" SIMPUT sources, with and without images, for
+  generating mock observations. See :ref:`simput` for details.
+* SOXS now uses the "spectrum" SIMPUT sources in all of the command line scripts
+  which create spatial models, so the signatures of those scripts have changed.
+  See :ref:`cmd-spatial` for details.
+* The Python function :meth:`~soxs.background.point_sources.make_point_source_list`
+  and the command line script :ref:`cmd-make-point-source-list` no longer require 
+  the ``exp_time`` and ``area`` arguments. 
+* The capability to create mosaics of multiple SOXS event files into a single
+  FITS image, with options for exposure correction, has been added. See 
+  :ref:`mosaic` for details.
+* It is no longer necessary to download response files manually, as response
+  files will now be downloaded automatically if they are needed to simulate
+  an observation or create a spectrum. See :ref:`response_files` for details.
+* Similarly, the latest version of the APEC tables is no longer packaged with
+  SOXS, both the CIE and NEI versions of the APEC tables will be downloaded
+  automatically if they are needed. See :ref:`thermal-spectra` for details.
+* SOXS now uses the `new 201-bin temperature files from AtomDB 
+  <http://www.atomdb.org/download.php>`_ for thermal spectrum models.
+* The SOXS configuration option ``"response_path"`` has been changed to
+  ``"soxs_data_dir"`` and the former is deprecated. See :ref:`configuration`
+  for details.
+* All instrument specifications must now specifically implement at least one
+  chip explicitly, so it is no longer permissible to specify the ``"chips"`` 
+  argument to be ``None``. **This is a backwards-incompatible change.**
+* Generating the galactic foreground and the instrumental background is now
+  faster and uses less memory. 
+* Exposure map calculation now uses far less memory and is slightly faster.
+* New options have been added to the :func:`~soxs.events.plot_spectrum` function.
+  See :ref:`plot-spectrum` for details.
+* *Chandra* grating responses for ACIS-S have been updated to Cycle 22.
+* SOXS now uses the 
+  `AstroPy Regions package <https://astropy-regions.readthedocs.io/en/latest/>`_ 
+  for region handling.
+* An option for writing ds9 regions corresponding to the sky positions and sizes 
+  of the halos from events created from the cosmology source catalog has been
+  added. See :ref:`cosmo-source-catalog` for more details.
+* The :class:`~soxs.spatial.DoubleBetaModel` spatial source model has been 
+  added (see :ref:`double-beta-model`), along with the command-line script 
+  :ref:`cmd-make-double-beta-model-source`.
+* The ``make_beta_model`` command line script has been renamed to
+  :ref:`cmd-make-beta-model-source.
+* An instrument specification for the 
+  `_STAR-X_ mission concept <https://ui.adsabs.harvard.edu/abs/2017SPIE10399E..08M/abstract>`_ 
+  has been added. 
+
 Version 2.3.0
 -------------
 

@@ -1,23 +1,25 @@
-from ._version import get_versions
+from soxs.background import \
+    BackgroundSpectrum, \
+    ConvolvedBackgroundSpectrum, \
+    make_point_sources_file, \
+    make_point_source_list, \
+    InstrumentalBackground
 
-from soxs.utils import soxs_cfg
+from soxs.cosmology import \
+    make_cosmological_sources_file
 
-from soxs.simput import \
-    write_photon_list, \
-    read_simput_catalog, \
-    PhotonList, SimputCatalog
-
-from soxs.spectra import \
-    Spectrum, \
-    ApecGenerator, \
-    ConvolvedSpectrum
+from soxs.events import \
+    write_spectrum, \
+    write_image, \
+    write_radial_profile, \
+    plot_spectrum, \
+    make_exposure_map, \
+    plot_image
 
 from soxs.instrument import \
     instrument_simulator, \
-    AuxiliaryResponseFile, \
-    RedistributionMatrixFile, \
     make_background_file, \
-    FlatResponse, simulate_spectrum
+    simulate_spectrum
 
 from soxs.instrument_registry import \
     add_instrument_to_registry, \
@@ -27,6 +29,22 @@ from soxs.instrument_registry import \
     instrument_registry, \
     make_simple_instrument
 
+from soxs.mosaic import \
+    make_mosaic_events, \
+    make_mosaic_image
+
+from soxs.response import \
+    AuxiliaryResponseFile, \
+    RedistributionMatrixFile, \
+    FlatResponse
+
+from soxs.simput import \
+    read_simput_catalog, \
+    SimputPhotonList, \
+    SimputCatalog, \
+    SimputSpectrum, \
+    write_photon_list
+
 from soxs.spatial import \
     PointSourceModel, \
     RadialFunctionModel, \
@@ -34,29 +52,16 @@ from soxs.spatial import \
     RadialFileModel, \
     AnnulusModel, \
     BetaModel, \
+    DoubleBetaModel, \
     FillFOVModel, \
     RectangleModel, \
     SpatialModel
 
-from soxs.events import \
-    write_spectrum, \
-    write_image, \
-    write_radial_profile, \
-    plot_spectrum, \
-    make_exposure_map
+from soxs.spectra import \
+    Spectrum, \
+    ApecGenerator, \
+    ConvolvedSpectrum
 
-from soxs.background import \
-    add_instrumental_background, \
-    BackgroundSpectrum, \
-    ConvolvedBackgroundSpectrum, \
-    InstrumentalBackgroundSpectrum
+from soxs.utils import soxs_cfg
 
-from soxs.cosmology import \
-    make_cosmological_sources_file
-
-from soxs.background import \
-    make_point_sources_file, \
-    make_point_source_list
-
-__version__ = get_versions()['version']
-del get_versions
+__version__ = "3.0.0"

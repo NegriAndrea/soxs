@@ -2,16 +2,16 @@ import os
 import numpy as np
 import h5py
 
-from tqdm import tqdm
+from tqdm.auto import tqdm
 
 from astropy.cosmology import FlatLambdaCDM
 from astropy.table import Table
 
-from soxs.simput import write_photon_list
 from soxs.spatial import BetaModel, construct_wcs
 from soxs.spectra import ApecGenerator
 from soxs.utils import soxs_files_path, mylog, parse_prng, \
     parse_value
+from soxs.simput import SimputCatalog, SimputPhotonList
 
 # Cosmological parameters for the catalog
 # SHOULD NOT BE ALTERED
@@ -55,7 +55,8 @@ def flux2lum(kT, z):
 
 def make_cosmological_sources(exp_time, fov, sky_center, cat_center=None,
                               absorb_model="wabs", nH=0.05, area=40000.0,
-                              output_sources=None, prng=None):
+                              output_sources=None, write_regions=None,
+                              prng=None):
     r"""
     Make an X-ray source made up of contributions from
     galaxy clusters, galaxy groups, and galaxies. 
@@ -85,6 +86,10 @@ def make_cosmological_sources(exp_time, fov, sky_center, cat_center=None,
     output_sources : string, optional
         If set to a filename, output the properties of the sources
         within the field of view to a file. Default: None
+    write_regions : string, optional
+        If set to a filename, output circle ds9 regions corresponding to the
+        positions of the halos with radii corresponding to their R500 
+        projected on the sky.  Default: None
     prng : :class:`~numpy.random.RandomState` object, integer, or None
         A pseudo-random number generator. Typically will only 
         be specified if you have a reason to generate the same 
@@ -182,7 +187,7 @@ def make_cosmological_sources(exp_time, fov, sky_center, cat_center=None,
         t = Table([ra0, dec0, rc_kpc, beta, ellip, theta, m,
                    r500_kpc, kT, z, flux_kcorr],
                   names=('RA', 'Dec', 'r_c', 'beta', 'ellipticity',
-                         'theta', 'M500c', 'r500', 'kT', 'redshift', 
+                         'theta', 'M500c', 'r500', 'kT', 'redshift',
                          'flux_0.5_2.0_keV'))
         t["RA"].unit = "deg"
         t["Dec"].unit = "deg"
@@ -193,6 +198,19 @@ def make_cosmological_sources(exp_time, fov, sky_center, cat_center=None,
         t["r500"].unit = "kpc"
         t["kT"].unit = "kT"
         t.write(output_sources, format='ascii.ecsv', overwrite=True)
+
+    if write_regions is not None:
+        from regions import CircleSkyRegion, write_ds9
+        from astropy.coordinates import Angle, SkyCoord
+        regs = []
+        for halo in range(n_halos):
+            c = SkyCoord(ra0[halo], dec0[halo], unit=("deg", "deg"), frame='fk5')
+            scale = cosmo.kpc_proper_per_arcmin(z[halo]).to("kpc/deg")
+            r500c = r500_kpc / scale.value
+            r = Angle(r500c, 'deg')
+            reg = CircleSkyRegion(c, r)
+            regs.append(reg)
+        write_ds9(regs, write_regions)
 
     tot_flux = 0.0
     ee = []
@@ -230,21 +248,22 @@ def make_cosmological_sources(exp_time, fov, sky_center, cat_center=None,
     return output_events
 
 
-def make_cosmological_sources_file(simput_prefix, phlist_prefix, exp_time, fov,
+def make_cosmological_sources_file(filename, name, exp_time, fov,
                                    sky_center, cat_center=None,
                                    absorb_model="wabs", nH=0.05, area=40000.0,
-                                   append=False, overwrite=False,
-                                   output_sources=None, prng=None):
+                                   overwrite=False, output_sources=None, 
+                                   write_regions=None, src_filename=None,
+                                   prng=None, append=False):
     r"""
     Make a SIMPUT catalog made up of contributions from
     galaxy clusters, galaxy groups, and galaxies.
 
     Parameters
     ----------
-    simput_prefix : string
-        The filename prefix for the SIMPUT file.
-    phlist_prefix : string
-        The filename prefix for the photon list file.
+    filename : string
+        The filename for the SIMPUT catalog.
+    name : string
+        The name of the SIMPUT photon list.
     exp_time : float, (value, unit) tuple, or :class:`~astropy.units.Quantity`
         The exposure time of the observation in seconds.
     fov : float, (value, unit) tuple, or :class:`~astropy.units.Quantity`
@@ -265,25 +284,40 @@ def make_cosmological_sources_file(simput_prefix, phlist_prefix, exp_time, fov,
         The effective area in cm**2. It must be large enough 
         so that a sufficiently large sample is drawn for the 
         ARF. Default: 40000.
-    append : boolean, optional
-        If True, append a new source an existing SIMPUT 
-        catalog. Default: False
     overwrite : boolean, optional
         Set to True to overwrite previous files. Default: False
     output_sources : string, optional
         If set to a filename, output the properties of the sources
-        within the field of view to a file. Default: None
+        within the field of view to an ASCII file. Default: None
+    write_regions : string, optional
+        If set to a filename, output circle ds9 regions corresponding to the
+        positions of the halos with radii corresponding to their R500 
+        projected on the sky. Default: None
+    src_filename : string, optional
+        If set, this will be the filename to write the source
+        to. By default, the source will be written to the same
+        file as the SIMPUT catalog
     prng : :class:`~numpy.random.RandomState` object, integer, or None
         A pseudo-random number generator. Typically will only 
         be specified if you have a reason to generate the same 
         set of random numbers, such as for a test. Default is None, 
         which sets the seed based on the system time. 
+    append : boolean, optional
+        If True, the photon list source will be appended to an existing
+        SIMPUT catalog. Default: False
     """
     events = make_cosmological_sources(exp_time, fov, sky_center,
                                        cat_center=cat_center,
                                        absorb_model=absorb_model, nH=nH,
                                        area=area, output_sources=output_sources,
-                                       prng=prng)
-    write_photon_list(simput_prefix, phlist_prefix, events["flux"],
-                      events["ra"], events["dec"], events["energy"],
-                      append=append, overwrite=overwrite)
+                                       write_regions=write_regions,prng=prng)
+    phlist = SimputPhotonList(events["ra"], events["dec"], events["energy"],
+                              events["flux"], name=name)
+    if append:
+        cat = SimputCatalog.from_file(filename)
+        cat.append(phlist, src_filename=src_filename, overwrite=overwrite)
+    else:
+        cat = SimputCatalog.from_source(filename, phlist,
+                                        src_filename=src_filename,
+                                        overwrite=overwrite)
+    return cat

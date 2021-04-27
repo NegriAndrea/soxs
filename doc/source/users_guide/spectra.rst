@@ -105,7 +105,8 @@ new :class:`~soxs.spectra.Spectrum` objects. You start by initializing an
 
 The ``broadening`` parameter sets whether or not spectral lines will be 
 thermally and velocity broadened. The ``apec_vers`` parameter sets the version 
-of the AtomDB tables to use. Version 3.0.9 is built into SOXS, and is the default.
+of the AtomDB tables to use. Version 3.0.9 is the default, and the tables will
+be downloaded if necessary. 
 
 You may also supply another location for the AtomDB tables. For example, the 
 following construction will look for the AtomDB tables in the current working 
@@ -114,6 +115,10 @@ directory:
 .. code-block:: python
 
     agen = ApecGenerator(0.05, 50.0, 10000, apec_root=".")
+
+If you set the ``apec_vers`` parameter but not the ``apec_root`` parameter, the
+AtomDB table files will be looked for in (1) the current working directory and
+(2) the location specified by ``soxs_data_dir`` in the :ref:`config`.
 
 Once you have an :class:`~soxs.spectra.ApecGenerator` object, you can use it to
 generate thermal spectra using the :meth:`~soxs.spectra.ApecGenerator.get_spectrum`
@@ -611,16 +616,17 @@ See :ref:`simput` for more information.
 -------------------
 
 One may want to examine a spectrum after it has been convolved with a particular
-effective area curve. One can generate such a spectrum using 
-:class:`~soxs.spectra.ConvolvedSpectrum` from a :class:`~soxs.spectra.Spectrum`
-object and an ARF:
+effective area curve. One can generate such a 
+:class:`~soxs.spectra.ConvolvedSpectrum` using the 
+:meth:`~soxs.spectra.ConvolvedSpectrum.convolve` method, feeding it a 
+:class:`~soxs.spectra.Spectrum` object and an ARF:
 
 .. code-block:: python
 
     from soxs import ConvolvedSpectrum
     # Assuming one created an ApecGenerator agen...
     spec2 = agen.get_spectrum(6.0, 0.3, 0.05, 1.0e-3)
-    cspec = ConvolvedSpectrum(spec2, "xrs_hdxi_3x10.arf")
+    cspec = ConvolvedSpectrum.convolve(spec2, "xrs_hdxi_3x10.arf")
     
 The spectrum in this object has units of 
 :math:`{\rm photons}~{\rm s}^{-1}~{\rm keV}^{-1}`, and one can use many of 
@@ -642,10 +648,6 @@ Or to generate an array of energies:
 
     t_exp = (500.0, "ks")
     e = cspec.generate_energies(t_exp)
-
-:class:`~soxs.spectra.ConvolvedSpectrum` objects are not used directly in the 
-instrument simulator, but can be used for convenient when one wants to examine 
-the properties of a convolved spectrum.
 
 If one has already loaded a :class:`~soxs.instrument.AuxiliaryResponseFile`,
 then one can also generate a :class:`~soxs.spectra.ConvolvedSpectrum` by simply
@@ -711,7 +713,7 @@ Writing a Spectrum to Disk
 
 :class:`~soxs.spectra.Spectrum` objects can be written to disk to either an 
 ASCII text file or an HDF5 file. To write a spectrum to an ASCII file, use the
-:meth:`~soxs.spectra.Spectrum.write_file`:
+:meth:`~soxs.spectra.Spectrum.write_file` method:
 
 .. code-block:: python
 

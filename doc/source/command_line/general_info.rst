@@ -9,19 +9,15 @@ Path to the Response Files
 --------------------------
 
 To use either the ``instrument_simulator`` or ``simulate_spectrum`` command-line
-scripts, it is necessary to download the response files from the :ref:`responses` 
-page and place them in an appropriate location, of which there are two. The first 
-is simply to place the response files needed for the instrument simulator in the 
-current working directory from which you run SOXS. However, it is probably more
-convenient to place the response files in a default path, which can be specified 
-in the SOXS configuration file like this:
-
-.. code-block:: text
-
-    [soxs]
-    response_path = /Users/jzuhone/Data/soxs_responses
-
-See :ref:`config` for more information about the location of the configuration file
+scripts, data files such as the instrumental responses, background models, and 
+PSF models are required. In versions of SOXS previous to v3.0.0, it was 
+necessary to download these files on your own and place them either in the 
+current working directory, or in a location specified by the :ref:`config`. Now,
+whenever an instrument is used, SOXS will first check the current working 
+directory for the necessary files, and then will check the location specified by
+the ``soxs_data_dir`` entry in the configuration file. If the files are not 
+found in either location, they will be downloaded automatically. See 
+:ref:`config` for more information about the location of the configuration file 
 and how to set its parameters.
 
 .. _cmd-units:
@@ -32,19 +28,19 @@ Special Argument Handling for Quantities with Units
 Many arguments in the command line scripts which have units can 
 take a special format which allows one to specify that particular
 quantity in the units desired by the user. For example, the 
-:ref:`cmd-make-point-source` script has the arguments ``exp_time``
+:ref:`cmd-make-cosmo-sources` script has the arguments ``exp_time``
 and ``area``, which assume the default units of seconds and :math:`\rm{cm^2}`,
 respectively, if one supplies floating-point numbers:
 
 .. code-block:: bash
 
-    [~]$ make_point_source pt_src src1 20.0 -32.0 pt_src_spectrum.dat 100000.0 --overwrite --area=30000.0
+    [~]$ make_cosmological_sources halos.simput halos 100000.0 10.0 22.0,-12.0 --area=30000.0 --overwrite
 
 but can take other units, like ks and :math:`\rm{m^2}`, in this format:
 
 .. code-block:: bash
 
-    [~]$ make_point_source pt_src src1 20.0 -32.0 pt_src_spectrum.dat 100.0,ks --overwrite --area=3.0,m**2
+    [~]$ make_cosmological_sources halos.simput halos 100.0,ks 10.0 22.0,-12.0 --area==3.0,m**2 --overwrite
 
 Since the quantities are the same but in different units, these two calls would
 be equivalent. 
@@ -82,10 +78,15 @@ Parameters Used in :ref:`cmd-make-annulus-source`
 * ``r_in``: Inner radius of annulus, default units of arcseconds
 * ``r_out``: Inner radius of annulus, default units of arcseconds
 
-Parameters Used in :ref:`cmd-make-beta-model`
-+++++++++++++++++++++++++++++++++++++++++++++
+Parameters Used in :ref:`cmd-make-beta-model-source`
+++++++++++++++++++++++++++++++++++++++++++++++++++++
 
 * ``r_c``: Core radius parameter, default units of arcseconds
+
+Parameters Used in :ref:`cmd-make-double-beta-model-source`
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+* ``r_c1``, ``r_c2``: Core radii parameters, default units of arcseconds
 
 Parameters Used in :ref:`cmd-make-rectangle-source`
 +++++++++++++++++++++++++++++++++++++++++++++++++++

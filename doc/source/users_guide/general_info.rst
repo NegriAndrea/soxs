@@ -5,25 +5,27 @@ General Information Regarding the Python Interface to SOXS
 
 .. _response-path:
 
-Path to the Response Files
---------------------------
+Path to SOXS Data Files
+-----------------------
 
-To use either the :func:`~soxs.instrument.instrument_simulator` or 
-:func:`~soxs.instrument.simulate_spectrum`, it is necessary to download the 
-response files from the :ref:`responses` page and place them in an appropriate
-location, of which there are two. The first is simply to place the response 
-files needed for the instrument simulator in the current working directory
-from which you run SOXS. However, it is probably more convenient to place the
-response files in a default path, which can be specified in the SOXS
-configuration file like this:
+To use either :func:`~soxs.instrument.instrument_simulator` or 
+:func:`~soxs.instrument.simulate_spectrum`, data files such as the instrumental
+responses, background models, and PSF models are required. In versions of SOXS
+previous to v3.0.0, it was necessary to download these files on your own and
+place them either in the current working directory, or in a location specified
+by the :ref:`config`. Now, whenever an instrument is used, SOXS will first 
+check the current working directory for the necessary files, and then will 
+check the location specified by the ``soxs_data_dir`` entry in the configuration
+file. If the files are not found in either location, they will be downloaded
+automatically. If ``soxs_data_dir`` is not set in the configuration file, or is
+set to an invalid directory, a default directory will be chosen:
 
-.. code-block:: text
+.. code-block:: pycon
 
-    [soxs]
-    response_path = /Users/jzuhone/Data/soxs_responses
+    soxs : [WARNING  ] 2021-04-14 22:05:49,790 Setting 'soxs_data_dir' to /Users/jzuhone/Library/Caches/soxs for this session. Please update your configuration if you want it somewhere else.
 
-See :ref:`config` for more information about the location of the configuration file
-and how to set its parameters.
+See :ref:`config` for more information about the location of the configuration 
+file and how to set its parameters.
 
 .. _units:
 
@@ -40,15 +42,15 @@ numbers, they will be in a default set of units:
 .. code-block:: python
 
     import soxs
-    simput_prefix = "cosmo"
-    phlist_prefix = "cosmo"
+    filename = "cosmo.simput"
+    name = "cosmo_srcs"
     sky_center = [30.0, 45.0]
     exp_time = 500000.0 # seconds
     fov = 40.0 # arcmin
     area = 40000.0 # cm^2
     nH = 0.02 # atoms/cm^2
-    make_cosmological_sources_file(simput_prefix, phlist_prefix, exp_time, fov, 
-                                   sky_center, nH=nH, area=area):
+    soxs.make_cosmological_sources_file(filename, name, exp_time, fov, 
+                                        sky_center, nH=nH, area=area):
 
 However, these same arguments accept values with unit information, either in the
 form of ``(value, unit)`` tuples, :class:`~astropy.units.Quantity`, or
@@ -58,15 +60,15 @@ form of ``(value, unit)`` tuples, :class:`~astropy.units.Quantity`, or
 
     import soxs
     from astropy.units import Quantity
-    simput_prefix = "cosmo"
-    phlist_prefix = "cosmo"
+    filename = "cosmo.simput"
+    name = "cosmo_srcs"
     sky_center = [30.0, 45.0]
     exp_time = (500.0, "ks")
     fov = Quantity(0.666667, "deg")
     area = (4.0, "m**2") 
     nH = Quantity(2.0e20, "cm**-2") 
-    make_cosmological_sources_file(simput_prefix, phlist_prefix, exp_time, fov, 
-                                   sky_center, nH=nH, area=area):
+    soxs.make_cosmological_sources_file(filename, name, exp_time, fov, 
+                                        sky_center, nH=nH, area=area):
 
 Since the quantities are the same but in different units, these two calls would
 be equivalent. Check the :ref:`api` for any given function or class definition 

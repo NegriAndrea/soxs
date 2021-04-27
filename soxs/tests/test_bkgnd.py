@@ -1,9 +1,10 @@
-from soxs.instrument import make_background, AuxiliaryResponseFile, \
-    instrument_simulator, make_background_file, simulate_spectrum, \
-    RedistributionMatrixFile
+from soxs.instrument import make_background, \
+    instrument_simulator, make_background_file, simulate_spectrum
 from soxs.background.foreground import hm_astro_bkgnd
-from soxs.background.instrument import acisi_particle_bkgnd
 from soxs.background.spectra import ConvolvedBackgroundSpectrum
+from soxs.spectra import Spectrum
+from soxs.response import AuxiliaryResponseFile, RedistributionMatrixFile
+from soxs.utils import soxs_files_path
 from numpy.random import RandomState
 from numpy.testing import assert_allclose
 import astropy.io.fits as pyfits
@@ -11,13 +12,16 @@ import tempfile
 import os
 import shutil
 import numpy as np
+import astropy.units as u
 
-prng = RandomState(24)
+acisi_particle_bkgnd = Spectrum.from_file(
+    os.path.join(soxs_files_path, "acisi_particle_bkgnd.h5"))
 
 
 def test_uniform_bkgnd_scale():
+    prng = RandomState(25)
     hdxi_arf = AuxiliaryResponseFile("xrs_hdxi_3x10.arf")
-    events, event_params = make_background((50, "ks"), "hdxi", [30., 45.], 
+    events, event_params = make_background((50, "ks"), "lynx_hdxi", [30., 45.], 
                                            foreground=True, instr_bkgnd=True,
                                            ptsrc_bkgnd=False, prng=prng)
     ncts = np.logical_and(events["energy"] >= 0.7, events["energy"] <= 2.0).sum()
@@ -25,9 +29,9 @@ def test_uniform_bkgnd_scale():
     fov = (event_params["fov"]*60.0)**2
     S = ncts/t_exp/fov
     dS = np.sqrt(ncts)/t_exp/fov
-    foreground = ConvolvedBackgroundSpectrum(hm_astro_bkgnd, hdxi_arf)
+    foreground = ConvolvedBackgroundSpectrum.convolve(hm_astro_bkgnd, hdxi_arf)
     f_sum = foreground.get_flux_in_band(0.7, 2.0)[0]
-    i_sum = acisi_particle_bkgnd.get_flux_in_band(0.7, 2.0)[0]
+    i_sum = acisi_particle_bkgnd.get_flux_in_band(0.7, 2.0)[0]*(u.cm/u.arcmin)**2
     b_sum = (f_sum+i_sum).to("ph/(arcsec**2*s)").value
     assert np.abs(S-b_sum) < 1.645*dS
 
@@ -44,20 +48,19 @@ def test_simulate_bkgnd_spectrum():
 
     exp_time = 50000.0
     fov = 3600.0
-    simulate_spectrum(None, "hdxi", exp_time, "test_bkgnd.pha",
+    simulate_spectrum(None, "lynx_hdxi", exp_time, "test_bkgnd.pha",
                       instr_bkgnd=True, foreground=True, prng=prng,
                       overwrite=True, bkgnd_area=(fov, "arcsec**2"))
-    ch_min = hdxi_rmf.e_to_ch(0.7)-hdxi_rmf.cmin
-    ch_max = hdxi_rmf.e_to_ch(2.0)-hdxi_rmf.cmin
-    f = pyfits.open("test_bkgnd.pha")
-    ncts = f["SPECTRUM"].data["COUNTS"][ch_min:ch_max].sum()
-    f.close()
+    ch_min = hdxi_rmf.eb_to_ch(0.7)-hdxi_rmf.cmin
+    ch_max = hdxi_rmf.eb_to_ch(2.0)-hdxi_rmf.cmin
+    with pyfits.open("test_bkgnd.pha") as f:
+        ncts = f["SPECTRUM"].data["COUNTS"][ch_min:ch_max].sum()
     S = ncts/exp_time/fov
     dS = np.sqrt(ncts)/exp_time/fov
-    foreground = ConvolvedBackgroundSpectrum(hm_astro_bkgnd, hdxi_arf)
+    foreground = ConvolvedBackgroundSpectrum.convolve(hm_astro_bkgnd, hdxi_arf)
     f_sum = foreground.get_flux_in_band(0.7, 2.0)[0]
-    i_sum = acisi_particle_bkgnd.get_flux_in_band(0.7, 2.0)[0]
-    b_sum = (f_sum+i_sum).to("ph/(arcsec**2*s)").value
+    i_sum = acisi_particle_bkgnd.get_flux_in_band(0.7, 2.0)[0]*(u.cm/u.arcmin)**2
+    b_sum = (f_sum+i_sum).to_value("ph/(arcsec**2*s)")
     assert np.abs(S-b_sum) < 1.645*dS
 
     os.chdir(curdir)
@@ -78,21 +81,13 @@ def test_add_background():
     dec1 = 22.0
     exp_time = 50000.0
 
-    ra = np.array([])
-    dec = np.array([])
-    e = np.array([])
-
-    empty_cat = {"ra": [ra], "dec": [dec], "energy": [e],
-                 "flux": [0.0], "emin": [0.1], "emax": [10.0],
-                 "sources": ["empty"]}
-
-    instrument_simulator(empty_cat, "evt1.fits", exp_time, "hdxi",
+    instrument_simulator(None, "evt1.fits", exp_time, "lynx_hdxi",
                          [ra0, dec0], prng=prng1, overwrite=True)
 
-    make_background_file("bkg_evt.fits", exp_time, "hdxi", [ra0, dec0],
+    make_background_file("bkg_evt.fits", exp_time, "lynx_hdxi", [ra0, dec0],
                          prng=prng2, overwrite=True)
 
-    instrument_simulator(empty_cat, "evt2.fits", exp_time, "hdxi",
+    instrument_simulator(None, "evt2.fits", exp_time, "lynx_hdxi",
                          [ra1, dec1], bkgnd_file="bkg_evt.fits",
                          prng=prng2, overwrite=True)
 
@@ -100,8 +95,8 @@ def test_add_background():
     f2 = pyfits.open("evt2.fits")
 
     for key in ["X", "Y", "ENERGY", "PHA"]:
-        assert_allclose(f1["EVENTS"].data[key], f2["EVENTS"].data[key], 
-                            )
+        assert_allclose(f1["EVENTS"].data[key], f2["EVENTS"].data[key], rtol=1.0e-6)
+
     f1.close()
     f2.close()
 
@@ -119,12 +114,10 @@ def test_ptsrc():
     os.chdir(tmpdir)
     prng = RandomState(33)
     fov = 20.0
-    exp_time = (500.0, "ks")
-    area = (30000.0, "cm**2")
     f_agn = np.zeros((cdf_fluxes.size-1, 100))
     f_gal = np.zeros((cdf_fluxes.size-1, 100))
     for k in range(100):
-        agn_fluxes, gal_fluxes = generate_fluxes(exp_time, area, fov, prng)
+        agn_fluxes, gal_fluxes = generate_fluxes(fov, prng)
         f_agn[:,k] = np.histogram(agn_fluxes, bins=cdf_fluxes)[0]
         f_gal[:,k] = np.histogram(gal_fluxes, bins=cdf_fluxes)[0]
     mu_agn = np.mean(f_agn, axis=1)
@@ -145,7 +138,7 @@ def test_ptsrc():
     sky_center = [20., 17.]
     prng1 = RandomState(33)
     prng2 = RandomState(33)
-    agn_fluxes, gal_fluxes = generate_fluxes(exp_time, area, fov, prng2)
+    agn_fluxes, gal_fluxes = generate_fluxes(fov, prng2)
     fluxes = np.concatenate([agn_fluxes, gal_fluxes])
     events = make_ptsrc_background(exp_time, fov, sky_center, area=area, 
                                    prng=prng1, nH=None, output_sources="src.dat")

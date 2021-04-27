@@ -1,16 +1,16 @@
 import numpy as np
-import astropy.io.fits as pyfits
-import astropy.wcs as pywcs
+from astropy.io import fits
+from astropy import wcs
 import os
 from soxs.utils import mylog, parse_value, get_rot_mat, \
-    downsample
+    create_region
 from soxs.instrument_registry import instrument_registry
-from tqdm import tqdm
+from tqdm.auto import tqdm
 
 
 def wcs_from_event_file(f):
     h = f["EVENTS"].header
-    w = pywcs.WCS(naxis=2)
+    w = wcs.WCS(naxis=2)
     w.wcs.crval = [h["TCRVL2"], h["TCRVL3"]]
     w.wcs.crpix = [h["TCRPX2"], h["TCRPX3"]]
     w.wcs.cdelt = [h["TCDLT2"], h["TCDLT3"]]
@@ -21,32 +21,34 @@ def wcs_from_event_file(f):
 
 def write_event_file(events, parameters, filename, overwrite=False):
     from astropy.time import Time, TimeDelta
-    mylog.info("Writing events to file %s." % filename)
+    mylog.info(f"Writing events to file {filename}.")
 
     t_begin = Time.now()
     dt = TimeDelta(parameters["exposure_time"], format='sec')
     t_end = t_begin + dt
 
-    col_x = pyfits.Column(name='X', format='D', unit='pixel', array=events["xpix"])
-    col_y = pyfits.Column(name='Y', format='D', unit='pixel', array=events["ypix"])
-    col_e = pyfits.Column(name='ENERGY', format='E', unit='eV', array=events["energy"]*1000.)
-    col_dx = pyfits.Column(name='DETX', format='D', unit='pixel', array=events["detx"])
-    col_dy = pyfits.Column(name='DETY', format='D', unit='pixel', array=events["dety"])
-    col_id = pyfits.Column(name='CCD_ID', format='D', unit='pixel', array=events["ccd_id"])
+    col_x = fits.Column(name='X', format='D', unit='pixel', array=events["xpix"])
+    col_y = fits.Column(name='Y', format='D', unit='pixel', array=events["ypix"])
+    col_e = fits.Column(name='ENERGY', format='E', unit='eV', array=events["energy"]*1000.)
+    col_dx = fits.Column(name='DETX', format='D', unit='pixel', array=events["detx"])
+    col_dy = fits.Column(name='DETY', format='D', unit='pixel', array=events["dety"])
+    col_id = fits.Column(name='CCD_ID', format='J', unit='pixel', array=events["ccd_id"])
 
-    chantype = parameters["channel_type"]
-    if chantype == "PHA":
+    chantype = parameters["channel_type"].lower()
+    if chantype == "pha":
         cunit = "adu"
-    elif chantype == "PI":
+    elif chantype == "pi":
         cunit = "Chan"
-    col_ch = pyfits.Column(name=chantype.upper(), format='1J', unit=cunit, array=events[chantype])
+    col_ch = fits.Column(name=chantype.upper(), format='1J', unit=cunit, 
+                           array=events[chantype])
 
-    col_t = pyfits.Column(name="TIME", format='1D', unit='s', array=events['time'])
+    col_t = fits.Column(name="TIME", format='1D', unit='s', 
+                          array=events['time'])
 
     cols = [col_e, col_x, col_y, col_ch, col_t, col_dx, col_dy, col_id]
 
-    coldefs = pyfits.ColDefs(cols)
-    tbhdu = pyfits.BinTableHDU.from_columns(coldefs)
+    coldefs = fits.ColDefs(cols)
+    tbhdu = fits.BinTableHDU.from_columns(coldefs)
     tbhdu.name = "EVENTS"
 
     tbhdu.header["MTYPE1"] = "sky"
@@ -97,18 +99,20 @@ def write_event_file(events, parameters, filename, overwrite=False):
     tbhdu.header["ROLL_PNT"] = parameters["roll_angle"]
     tbhdu.header["AIMPT_X"] = parameters["aimpt_coords"][0]
     tbhdu.header["AIMPT_Y"] = parameters["aimpt_coords"][1]
+    tbhdu.header["AIMPT_DX"] = parameters["aimpt_shift"][0]
+    tbhdu.header["AIMPT_DY"] = parameters["aimpt_shift"][1]
     if parameters["dither_params"]["dither_on"]:
         tbhdu.header["DITHXAMP"] = parameters["dither_params"]["x_amp"]
         tbhdu.header["DITHYAMP"] = parameters["dither_params"]["y_amp"]
         tbhdu.header["DITHXPER"] = parameters["dither_params"]["x_period"]
         tbhdu.header["DITHYPER"] = parameters["dither_params"]["y_period"]
 
-    start = pyfits.Column(name='START', format='1D', unit='s',
+    start = fits.Column(name='START', format='1D', unit='s',
                           array=np.array([0.0]))
-    stop = pyfits.Column(name='STOP', format='1D', unit='s',
+    stop = fits.Column(name='STOP', format='1D', unit='s',
                          array=np.array([parameters["exposure_time"]]))
 
-    tbhdu_gti = pyfits.BinTableHDU.from_columns([start,stop])
+    tbhdu_gti = fits.BinTableHDU.from_columns([start,stop])
     tbhdu_gti.name = "STDGTI"
     tbhdu_gti.header["TSTART"] = 0.0
     tbhdu_gti.header["TSTOP"] = parameters["exposure_time"]
@@ -121,29 +125,14 @@ def write_event_file(events, parameters, filename, overwrite=False):
     tbhdu_gti.header["DATE-OBS"] = t_begin.tt.isot
     tbhdu_gti.header["DATE-END"] = t_end.tt.isot
 
-    hdulist = [pyfits.PrimaryHDU(), tbhdu, tbhdu_gti]
+    hdulist = [fits.PrimaryHDU(), tbhdu, tbhdu_gti]
 
-    pyfits.HDUList(hdulist).writeto(filename, overwrite=overwrite)
-
-
-def parse_region_args(rtype, args, dx, dy):
-    if rtype == "Box":
-        xctr, yctr, xw, yw = args
-        new_args = [xctr + dx, yctr + dy, xw, yw]
-    elif rtype == "Circle":
-        xctr, yctr, radius = args
-        new_args = [xctr + dx, yctr + dx, radius]
-    elif rtype == "Polygon":
-        new_args = [[x + dx for x in args[0]],
-                    [y + dy for y in args[1]]]
-    else:
-        raise NotImplementedError
-    return new_args
+    fits.HDUList(hdulist).writeto(filename, overwrite=overwrite)
 
 
 def make_exposure_map(event_file, expmap_file, energy, weights=None,
                       asol_file=None, normalize=True, overwrite=False,
-                      reblock=1, nhistx=16, nhisty=16, order=1):
+                      reblock=1, nhistx=16, nhisty=16):
     """
     Make an exposure map for a SOXS event file, and optionally write
     an aspect solution file. The exposure map will be created by
@@ -172,7 +161,7 @@ def make_exposure_map(event_file, expmap_file, energy, weights=None,
     overwrite : boolean, optional
         Whether or not to overwrite an existing file. Default: False
     reblock : integer, optional
-        Supply an integer power of 2 here to make an exposure map 
+        Supply an integer power of 2 here to make an exposure map
         with a different binning. Default: 1
     nhistx : integer, optional
         The number of bins in the aspect histogram in the DETX
@@ -184,15 +173,15 @@ def make_exposure_map(event_file, expmap_file, energy, weights=None,
         The interpolation order to use when making the exposure map. 
         Default: 1
     """
-    import pyregion._region_filter as rfilter
-    from scipy.ndimage.interpolation import rotate, shift
-    from soxs.instrument import AuxiliaryResponseFile, perform_dither
+    from scipy.ndimage.interpolation import rotate
+    from soxs.instrument import perform_dither
+    from soxs.response import AuxiliaryResponseFile
     if isinstance(energy, np.ndarray) and weights is None:
         raise RuntimeError("Must supply a single value for the energy if "
                            "you do not supply weights!")
     if not isinstance(energy, np.ndarray):
         energy = parse_value(energy, "keV")
-    f_evt = pyfits.open(event_file)
+    f_evt = fits.open(event_file)
     hdu = f_evt["EVENTS"]
     arf = AuxiliaryResponseFile(hdu.header["ANCRFILE"])
     exp_time = hdu.header["EXPOSURE"]
@@ -204,10 +193,10 @@ def make_exposure_map(event_file, expmap_file, energy, weights=None,
     ydel = hdu.header["TCDLT3"]
     x0 = hdu.header["TCRPX2"]
     y0 = hdu.header["TCRPX3"]
-    xdet0 = 0.5*(2*nx+1)
-    ydet0 = 0.5*(2*ny+1)
     xaim = hdu.header.get("AIMPT_X", 0.0)
     yaim = hdu.header.get("AIMPT_Y", 0.0)
+    xaim += hdu.header.get("AIMPT_DX", 0.0)
+    yaim += hdu.header.get("AIMPT_DY", 0.0)
     roll = hdu.header["ROLL_PNT"]
     instr = instrument_registry[hdu.header["INSTRUME"].lower()]
     dither_params = {}
@@ -227,7 +216,7 @@ def make_exposure_map(event_file, expmap_file, energy, weights=None,
     t = np.arange(0.0, exp_time+dt, dt)
 
     # Construct WCS
-    w = pywcs.WCS(naxis=2)
+    w = wcs.WCS(naxis=2)
     w.wcs.crval = [ra0, dec0]
     w.wcs.crpix = [x0, y0]
     w.wcs.cdelt = [xdel, ydel]
@@ -247,43 +236,47 @@ def make_exposure_map(event_file, expmap_file, energy, weights=None,
         asphist *= dt
         x_mid = 0.5*(x_edges[1:]+x_edges[:-1])/reblock
         y_mid = 0.5*(y_edges[1:]+y_edges[:-1])/reblock
+    else:
+        asphist = exp_time*np.ones((1,1))
 
     # Determine the effective area
     eff_area = arf.interpolate_area(energy).value
     if weights is not None:
         eff_area = np.average(eff_area, weights=weights)
 
-    if instr["chips"] is None:
-        rtypes = ["Box"]
-        args = [[0.0, 0.0, instr["num_pixels"], instr["num_pixels"]]]
-    else:
-        rtypes = []
-        args = []
-        for i, chip in enumerate(instr["chips"]):
-            rtypes.append(chip[0])
-            args.append(np.array(chip[1:]))
+    rtypes = []
+    args = []
+    for i, chip in enumerate(instr["chips"]):
+        rtypes.append(chip[0])
+        args.append(np.array(chip[1:])/reblock)
 
-    tmpmap = np.zeros((2*nx, 2*ny))
-
-    for rtype, arg in zip(rtypes, args):
-        rfunc = getattr(rfilter, rtype)
-        new_args = parse_region_args(rtype, arg, xdet0-xaim-1.0, ydet0-yaim-1.0)
-        r = rfunc(*new_args)
-        tmpmap += r.mask(tmpmap).astype("float64")
-
-    tmpmap = downsample(tmpmap, reblock)
+    xdet0 = 0.5*(2*nx//reblock+1)
+    ydet0 = 0.5*(2*ny//reblock+1)
+    xaim //= reblock
+    yaim //= reblock
+    dx = xdet0-xaim-1.0
+    dy = ydet0-yaim-1.0
 
     if dither_params["dither_on"]:
-        expmap = np.zeros(tmpmap.shape)
-        niter = nhistx*nhisty
-        pbar = tqdm(leave=True, total=niter, desc="Creating exposure map ")
-        for i in range(nhistx):
-            for j in range(nhisty):
-                expmap += shift(tmpmap, (x_mid[i], y_mid[j]), order=order)*asphist[i, j]
-            pbar.update(nhisty)
-        pbar.close()
+        niterx = nhistx
+        nitery = nhisty
     else:
-        expmap = tmpmap*exp_time
+        niterx = 1
+        nitery = 1
+
+    expmap = np.zeros((2*nx//reblock, 2*ny//reblock))
+    niter = niterx*nitery
+    pbar = tqdm(leave=True, total=niter, desc="Creating exposure map ")
+    for i in range(niterx):
+        for j in range(nitery):
+            chips, _ = create_region(rtypes[0], args[0], dx+x_mid[i], dy+y_mid[j])
+            for rtype, arg in zip(rtypes[1:], args[1:]):
+                r, _ = create_region(rtype, arg, dx+x_mid[i], dy+y_mid[j])
+                chips = chips | r
+            dexp = chips.to_mask().to_image(expmap.shape).astype("float64")
+            expmap += dexp*asphist[i,j]
+        pbar.update(nitery)
+    pbar.close()
 
     expmap *= eff_area
     if normalize:
@@ -308,7 +301,7 @@ def make_exposure_map(event_file, expmap_file, energy, weights=None,
                   "CRPIX1": 0.5*(2.0*nx//reblock+1),
                   "CRPIX2": 0.5*(2.0*ny//reblock+1)}
 
-    map_hdu = pyfits.ImageHDU(expmap, header=pyfits.Header(map_header))
+    map_hdu = fits.ImageHDU(expmap, header=fits.Header(map_header))
     map_hdu.name = "EXPMAP"
     map_hdu.writeto(expmap_file, overwrite=overwrite)
 
@@ -322,18 +315,18 @@ def make_exposure_map(event_file, expmap_file, energy, weights=None,
 
             ra, dec = w.wcs_pix2world(pix[0,:]+x0, pix[1,:]+y0, 1)
 
-            col_t = pyfits.Column(name='time', format='D', unit='s', array=t)
-            col_ra = pyfits.Column(name='ra', format='D', unit='deg', array=ra)
-            col_dec = pyfits.Column(name='dec', format='D', unit='deg', array=dec)
+            col_t = fits.Column(name='time', format='D', unit='s', array=t)
+            col_ra = fits.Column(name='ra', format='D', unit='deg', array=ra)
+            col_dec = fits.Column(name='dec', format='D', unit='deg', array=dec)
 
-            coldefs = pyfits.ColDefs([col_t, col_ra, col_dec])
-            tbhdu = pyfits.BinTableHDU.from_columns(coldefs)
+            coldefs = fits.ColDefs([col_t, col_ra, col_dec])
+            tbhdu = fits.BinTableHDU.from_columns(coldefs)
             tbhdu.name = "ASPSOL"
             tbhdu.header["EXPOSURE"] = exp_time
 
-            hdulist = [pyfits.PrimaryHDU(), tbhdu]
+            hdulist = [fits.PrimaryHDU(), tbhdu]
 
-            pyfits.HDUList(hdulist).writeto(asol_file, overwrite=overwrite)
+            fits.HDUList(hdulist).writeto(asol_file, overwrite=overwrite)
 
         else:
 
@@ -344,14 +337,14 @@ def make_exposure_map(event_file, expmap_file, energy, weights=None,
 def _write_spectrum(bins, spec, exp_time, spectype, parameters,
                     specfile, overwrite=False):
 
-    col1 = pyfits.Column(name='CHANNEL', format='1J', array=bins)
-    col2 = pyfits.Column(name=spectype.upper(), format='1D', array=bins.astype("float64"))
-    col3 = pyfits.Column(name='COUNTS', format='1J', array=spec.astype("int32"))
-    col4 = pyfits.Column(name='COUNT_RATE', format='1D', array=spec/exp_time)
+    col1 = fits.Column(name='CHANNEL', format='1J', array=bins)
+    col2 = fits.Column(name=spectype.upper(), format='1D', array=bins.astype("float64"))
+    col3 = fits.Column(name='COUNTS', format='1J', array=spec.astype("int32"))
+    col4 = fits.Column(name='COUNT_RATE', format='1D', array=spec/exp_time)
 
-    coldefs = pyfits.ColDefs([col1, col2, col3, col4])
+    coldefs = fits.ColDefs([col1, col2, col3, col4])
 
-    tbhdu = pyfits.BinTableHDU.from_columns(coldefs)
+    tbhdu = fits.BinTableHDU.from_columns(coldefs)
     tbhdu.name = "SPECTRUM"
 
     tbhdu.header["DETCHANS"] = spec.size
@@ -376,7 +369,7 @@ def _write_spectrum(bins, spec, exp_time, spectype, parameters,
     tbhdu.header["CORRSCAL"] = 0.0
     tbhdu.header["BACKSCAL"] = 1.0
 
-    hdulist = pyfits.HDUList([pyfits.PrimaryHDU(), tbhdu])
+    hdulist = fits.HDUList([fits.PrimaryHDU(), tbhdu])
 
     hdulist.writeto(specfile, overwrite=overwrite)
 
@@ -397,10 +390,10 @@ def write_spectrum(evtfile, specfile, overwrite=False):
         Whether or not to overwrite an existing file with 
         the same name. Default: False
     """
-    from soxs.instrument import RedistributionMatrixFile
+    from soxs.response import RedistributionMatrixFile
     parameters = {}
     if isinstance(evtfile, str):
-        f = pyfits.open(evtfile)
+        f = fits.open(evtfile)
         spectype = f["EVENTS"].header["CHANTYPE"]
         rmf = f["EVENTS"].header["RESPFILE"]
         p = f["EVENTS"].data[spectype]
@@ -474,10 +467,9 @@ def write_radial_profile(evt_file, out_file, ctr, rmin,
         Supply an exposure map file to determine fluxes. 
         Default: None
     """
-    import astropy.wcs as pywcs
     rmin = parse_value(rmin, "arcsec")
     rmax = parse_value(rmax, "arcsec")
-    f = pyfits.open(evt_file)
+    f = fits.open(evt_file)
     hdu = f["EVENTS"]
     orig_dx = hdu.header["TCDLT3"]
     e = hdu.data["ENERGY"]
@@ -518,23 +510,23 @@ def write_radial_profile(evt_file, out_file, ctr, rmin,
     S = R/A
     Serr = Rerr/A
 
-    col1 = pyfits.Column(name='RLO', format='D', unit='arcsec', array=rbin[:-1])
-    col2 = pyfits.Column(name='RHI', format='D', unit='arcsec', array=rbin[1:])
-    col3 = pyfits.Column(name='RMID', format='D', unit='arcsec', array=rmid)
-    col4 = pyfits.Column(name='AREA', format='D', unit='arcsec**2', array=A)
-    col5 = pyfits.Column(name='NET_COUNTS', format='D', unit='count', array=C)
-    col6 = pyfits.Column(name='NET_ERR', format='D', unit='count', array=Cerr)
-    col7 = pyfits.Column(name='NET_RATE', format='D', unit='count/s', array=R)
-    col8 = pyfits.Column(name='ERR_RATE', format='D', unit='count/s', array=Rerr)
-    col9 = pyfits.Column(name='SUR_BRI', format='D', unit='count/s/arcsec**2', array=S)
-    col10 = pyfits.Column(name='SUR_BRI_ERR', format='1D', unit='count/s/arcsec**2', array=Serr)
+    col1 = fits.Column(name='RLO', format='D', unit='arcsec', array=rbin[:-1])
+    col2 = fits.Column(name='RHI', format='D', unit='arcsec', array=rbin[1:])
+    col3 = fits.Column(name='RMID', format='D', unit='arcsec', array=rmid)
+    col4 = fits.Column(name='AREA', format='D', unit='arcsec**2', array=A)
+    col5 = fits.Column(name='NET_COUNTS', format='D', unit='count', array=C)
+    col6 = fits.Column(name='NET_ERR', format='D', unit='count', array=Cerr)
+    col7 = fits.Column(name='NET_RATE', format='D', unit='count/s', array=R)
+    col8 = fits.Column(name='ERR_RATE', format='D', unit='count/s', array=Rerr)
+    col9 = fits.Column(name='SUR_BRI', format='D', unit='count/s/arcsec**2', array=S)
+    col10 = fits.Column(name='SUR_BRI_ERR', format='1D', unit='count/s/arcsec**2', array=Serr)
 
     coldefs = [col1, col2, col3, col4, col5, col6, col7, col8, col9, col10]
 
     if expmap_file is not None:
-        f = pyfits.open(expmap_file)
+        f = fits.open(expmap_file)
         ehdu = f["EXPMAP"]
-        wexp = pywcs.WCS(header=ehdu.header)
+        wexp = wcs.WCS(header=ehdu.header)
         cel = w.all_pix2world(ctr[0], ctr[1], 1)
         ectr = wexp.all_world2pix(cel[0], cel[1], 1)
         exp = ehdu.data[:,:]
@@ -549,19 +541,20 @@ def write_radial_profile(evt_file, out_file, ctr, rmin,
             Ferr = Rerr/E
         SF = F/A
         SFerr = Ferr/A
-        col11 = pyfits.Column(name='MEAN_SRC_EXP', format='D', unit='cm**2', array=E)
-        col12 = pyfits.Column(name='NET_FLUX', format='D', unit='count/s/cm**2', array=F)
-        col13 = pyfits.Column(name='NET_FLUX_ERR', format='D', unit='count/s/cm**2', array=Ferr)
-        col14 = pyfits.Column(name='SUR_FLUX', format='D', unit='count/s/cm**2/arcsec**2', array=SF)
-        col15 = pyfits.Column(name='SUR_FLUX_ERR', format='D', unit='count/s/cm**2/arcsec**2', array=SFerr)
+        col11 = fits.Column(name='MEAN_SRC_EXP', format='D', unit='cm**2', array=E)
+        col12 = fits.Column(name='NET_FLUX', format='D', unit='count/s/cm**2', array=F)
+        col13 = fits.Column(name='NET_FLUX_ERR', format='D', unit='count/s/cm**2', array=Ferr)
+        col14 = fits.Column(name='SUR_FLUX', format='D', unit='count/s/cm**2/arcsec**2', array=SF)
+        col15 = fits.Column(name='SUR_FLUX_ERR', format='D', unit='count/s/cm**2/arcsec**2', array=SFerr)
         coldefs += [col11, col12, col13, col14, col15]
 
-    tbhdu = pyfits.BinTableHDU.from_columns(pyfits.ColDefs(coldefs))
+    tbhdu = fits.BinTableHDU.from_columns(fits.ColDefs(coldefs))
     tbhdu.name = "PROFILE"
 
-    hdulist = pyfits.HDUList([pyfits.PrimaryHDU(), tbhdu])
+    hdulist = fits.HDUList([fits.PrimaryHDU(), tbhdu])
 
     hdulist.writeto(out_file, overwrite=overwrite)
+
 
 coord_types = {"sky": ("X", "Y", 2, 3),
                "det": ("DETX", "DETY", 6, 7)}
@@ -583,11 +576,9 @@ def write_image(evt_file, out_file, coord_type='sky', emin=None, emax=None,
         The type of coordinate to bin into an image. 
         Can be "sky" or "det". Default: "sky"
     emin : float, (value, unit) tuple, or :class:`~astropy.units.Quantity`, optional
-        The minimum energy of the photons to put in the 
-        image, in keV.
+        The minimum energy of the photons to put in the image, in keV.
     emax : float, (value, unit) tuple, or :class:`~astropy.units.Quantity`, optional
-        The maximum energy of the photons to put in the 
-        image, in keV.
+        The maximum energy of the photons to put in the image, in keV.
     overwrite : boolean, optional
         Whether or not to overwrite an existing file with 
         the same name. Default: False
@@ -599,35 +590,35 @@ def write_image(evt_file, out_file, coord_type='sky', emin=None, emax=None,
         pixel sizes (reblock >= 1). Only supported for
         sky coordinates. Default: 1
     """
+    if emin is None:
+        emin = 0.0
+    else:
+        emin = parse_value(emin, "keV")
+    emin *= 1000.
+    if emax is None:
+        emax = 100.0
+    else:
+        emax = parse_value(emax, "keV")
+    emax *= 1000.
     if coord_type == "det" and reblock > 1:
         raise RuntimeError("Reblocking images is not supported "
                            "for detector coordinates!")
-    f = pyfits.open(evt_file)
+    f = fits.open(evt_file)
     e = f["EVENTS"].data["ENERGY"]
-    if emin is None:
-        emin = e.min()
-    else:
-        emin = parse_value(emin, "keV")
-        emin *= 1000.
-    if emax is None:
-        emax = e.max()
-    else:
-        emax = parse_value(emax, "keV")
-        emax *= 1000.
     idxs = np.logical_and(e > emin, e < emax)
     xcoord, ycoord, xcol, ycol = coord_types[coord_type]
     x = f["EVENTS"].data[xcoord][idxs]
     y = f["EVENTS"].data[ycoord][idxs]
     exp_time = f["EVENTS"].header["EXPOSURE"]
-    xmin = f["EVENTS"].header["TLMIN%d" % xcol]
-    ymin = f["EVENTS"].header["TLMIN%d" % ycol]
-    xmax = f["EVENTS"].header["TLMAX%d" % xcol]
-    ymax = f["EVENTS"].header["TLMAX%d" % ycol]
+    xmin = f["EVENTS"].header[f"TLMIN{xcol}"]
+    ymin = f["EVENTS"].header[f"TLMIN{ycol}"]
+    xmax = f["EVENTS"].header[f"TLMAX{xcol}"]
+    ymax = f["EVENTS"].header[f"TLMAX{ycol}"]
     if coord_type == 'sky':
-        xctr = f["EVENTS"].header["TCRVL%d" % xcol]
-        yctr = f["EVENTS"].header["TCRVL%d" % ycol]
-        xdel = f["EVENTS"].header["TCDLT%d" % xcol]*reblock
-        ydel = f["EVENTS"].header["TCDLT%d" % ycol]*reblock
+        xctr = f["EVENTS"].header[f"TCRVL{xcol}"]
+        yctr = f["EVENTS"].header[f"TCRVL{ycol}"]
+        xdel = f["EVENTS"].header[f"TCDLT{xcol}"]*reblock
+        ydel = f["EVENTS"].header[f"TCDLT{ycol}"]*reblock
     f.close()
 
     nx = int(xmax-xmin)//reblock
@@ -642,7 +633,7 @@ def write_image(evt_file, out_file, coord_type='sky', emin=None, emax=None,
         if coord_type == "det":
             raise RuntimeError("Cannot divide by an exposure map for images "
                                "binned in detector coordinates!")
-        f = pyfits.open(expmap_file)
+        f = fits.open(expmap_file)
         if f["EXPMAP"].shape != (nx, ny):
             raise RuntimeError("Exposure map and image do not have the same shape!!")
         with np.errstate(invalid='ignore', divide='ignore'):
@@ -652,7 +643,7 @@ def write_image(evt_file, out_file, coord_type='sky', emin=None, emax=None,
         H[H < 0.0] = 0.0
         f.close()
 
-    hdu = pyfits.PrimaryHDU(H.T)
+    hdu = fits.PrimaryHDU(H.T)
 
     if coord_type == 'sky':
         hdu.header["MTYPE1"] = "EQPOS"
@@ -672,14 +663,16 @@ def write_image(evt_file, out_file, coord_type='sky', emin=None, emax=None,
         hdu.header["CUNIT2"] = "pixel"
 
     hdu.header["EXPOSURE"] = exp_time
+    hdu.name = "IMAGE"
 
     hdu.writeto(out_file, overwrite=overwrite)
 
 
-def plot_spectrum(specfile, plot_energy=True, lw=2, xmin=None, xmax=None,
-                  ymin=None, ymax=None, xscale=None, yscale=None, 
-                  label=None, fontsize=18, fig=None, ax=None, 
-                  plot_counts=False, **kwargs):
+def plot_spectrum(specfile, plot_energy=True, ebins=None, lw=2, 
+                  xmin=None, xmax=None, ymin=None, ymax=None, 
+                  xscale=None, yscale=None, label=None, 
+                  fontsize=18, fig=None, ax=None, plot_counts=False,
+                  noerr=False, plot_used=False, **kwargs):
     """
     Make a quick Matplotlib plot of a convolved spectrum
     from a file. A Matplotlib figure and axis is returned.
@@ -688,13 +681,14 @@ def plot_spectrum(specfile, plot_energy=True, lw=2, xmin=None, xmax=None,
     ----------
     specfile : string
         The file to be opened for plotting.
-    figsize : tuple of integers, optional
-        The size of the figure on both sides in inches.
-        Default: (10,10)
     plot_energy : boolean, optional
         Whether to plot in energy or channel space. Default is
         to plot in energy, unless the RMF for the spectrum
-        cannot be found. 
+        cannot be found.
+    ebins : NumPy array, optional
+        If set, these are the energy bin edges in which the spectrum
+        will be binned. If not set, the counts will be binned according
+        to channel. Default: None
     lw : float, optional
         The width of the lines in the plots. Default: 2.0 px.
     xmin : float, optional
@@ -724,43 +718,53 @@ def plot_spectrum(specfile, plot_energy=True, lw=2, xmin=None, xmax=None,
     plot_counts : boolean, optional
         If set to True, the counts instead of the count rate will
         be plotted. Default: False
+    noerr : boolean, optional
+        If True, the spectrum will be plotted without errorbars. 
+        Default: False
+    plot_used : boolean, optional
+        If set to True, only the bins which contain more than 0 
+        counts will be plotted. Default: False
 
     Returns
     -------
-    A tuple of the :class:`~matplotlib.figure.Figure` and the :class:`~matplotlib.axes.Axes` objects.
+    A tuple of the :class:`~matplotlib.figure.Figure` and the 
+    :class:`~matplotlib.axes.Axes` objects.
     """
     import matplotlib.pyplot as plt
     from soxs.instrument import RedistributionMatrixFile
-    f = pyfits.open(specfile)
+    f = fits.open(specfile)
     hdu = f["SPECTRUM"]
     chantype = hdu.header["CHANTYPE"]
-    rmf = hdu.header.get("RESPFILE", None)
-    xerr = None
+    y = hdu.data["COUNTS"].astype("float64")
     if plot_energy:
+        rmf = hdu.header.get("RESPFILE", None)
         if rmf is not None:
             rmf = RedistributionMatrixFile(rmf)
-            x = 0.5*(rmf.ebounds_data["E_MIN"]+rmf.ebounds_data["E_MAX"])
-            xerr = 0.5*(rmf.ebounds_data["E_MAX"]-rmf.ebounds_data["E_MIN"])
+            e = 0.5*(rmf.ebounds_data["E_MIN"]+rmf.ebounds_data["E_MAX"])
+            if ebins is None:
+                xmid = e
+                xerr = 0.5*(rmf.ebounds_data["E_MAX"]-rmf.ebounds_data["E_MIN"])
+            else:
+                xmid = 0.5*(ebins[1:]+ebins[:-1])
+                xerr = 0.5 * np.diff(ebins)
+                y = np.histogram(e, ebins, weights=y)[0].astype("float64")
             xlabel = "Energy (keV)"
         else:
             raise RuntimeError("Cannot find the RMF associated with this "
                                "spectrum, so I cannot plot in energy!")
     else:
-        x = hdu.data[chantype]
-        xlabel = "Channel (%s)" % chantype
-    if plot_counts:
-        y = hdu.data["COUNTS"].astype("float64")
-        yerr = np.sqrt(y)
-    else:
-        if "COUNT_RATE" in hdu.columns.names:
-            y = hdu.data["COUNT_RATE"]
-        else:
-            y = hdu.data["COUNTS"]/hdu.header["EXPOSURE"]
-        yerr = np.sqrt(hdu.data["COUNTS"])/hdu.header["EXPOSURE"]
+        xmid = hdu.data[chantype]
+        xerr = 0.5
+        xlabel = f"Channel ({chantype})"
+    dx = 2.0*xerr
+    yerr = np.sqrt(y)
+    if not plot_counts:
+        y /= hdu.header["EXPOSURE"]
+        yerr /= hdu.header["EXPOSURE"]
     if plot_energy:
         yunit = "keV"
-        y /= 2.0*xerr
-        yerr /= 2.0*xerr
+        y /= dx
+        yerr /= dx
     else:
         yunit = "bin"
     f.close()
@@ -778,16 +782,104 @@ def plot_spectrum(specfile, plot_energy=True, lw=2, xmin=None, xmax=None,
             yscale = ax.get_yscale()
     if ax is None:
         ax = fig.add_subplot(111)
-    ax.errorbar(x, y, yerr=yerr, xerr=xerr, lw=lw, label=label, **kwargs)
+    if plot_used:
+        used = y > 0
+        xmid = xmid[used]
+        y = y[used]
+        xerr = xerr[used]
+        yerr = yerr[used]
+    if noerr:
+        ax.plot(xmid, y, lw=lw, label=label, **kwargs)
+    else:
+        ax.errorbar(xmid, y, yerr=yerr, xerr=xerr, lw=lw, label=label, **kwargs)
     ax.set_xscale(xscale)
     ax.set_yscale(yscale)
     ax.set_xlim(xmin, xmax)
     ax.set_ylim(ymin, ymax)
     ax.set_xlabel(xlabel, fontsize=fontsize)
     if plot_counts:
-        ylabel = "Counts (counts/%s)"
+        ylabel = "Counts (counts/{0})"
     else:
-        ylabel = "Count Rate (counts/s/%s)"
-    ax.set_ylabel(ylabel % yunit, fontsize=fontsize)
+        ylabel = "Count Rate (counts/s/{0})"
+    ax.set_ylabel(ylabel.format(yunit), fontsize=fontsize)
     ax.tick_params(axis='both', labelsize=fontsize)
+    return fig, ax
+
+
+def plot_image(img_file, hdu="IMAGE", stretch='linear', vmin=None, vmax=None,
+               facecolor='black', center=None, width=None, figsize=(10, 10),
+               cmap=None):
+    """
+    Plot a FITS image created by SOXS using Matplotlib.
+
+    Parameters
+    ----------
+    img_file : str
+        The on-disk FITS image to plot. 
+    hdu : str or int, optional
+        The image extension to plot. Default is "IMAGE"
+    stretch : str, optional
+        The stretch to apply to the colorbar scale. Options are "linear",
+        "log", and "sqrt". Default: "linear"
+    vmin : float, optional
+        The minimum value of the colorbar. If not set, it will be the minimum
+        value in the image.
+    vmax : float, optional
+        The maximum value of the colorbar. If not set, it will be the maximum
+        value in the image.
+    facecolor : str, optional
+        The color of zero-valued pixels. Default: "black"
+    center : array-like
+        A 2-element object giving an (RA, Dec) coordinate for the center
+        in degrees. If not set, the reference pixel of the image (usually
+        the center) is used.
+    width : float, optional
+        The width of the image in degrees. If not set, the width of the
+        entire image will be used.
+    figsize : tuple, optional
+        A 2-tuple giving the size of the image in inches, e.g. (12, 15).
+        Default: (10,10)
+    cmap : str, optional
+        The colormap to be used. If not set, the default Matplotlib
+        colormap will be used.
+
+    Returns
+    -------
+    A tuple of the :class:`~matplotlib.figure.Figure` and the 
+    :class:`~matplotlib.axes.Axes` objects.
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import PowerNorm, LogNorm, Normalize
+    from astropy.wcs.utils import proj_plane_pixel_scales
+    from astropy.visualization.wcsaxes import WCSAxes
+    if stretch == "linear":
+        norm = Normalize(vmin=vmin, vmax=vmax)
+    elif stretch == "log":
+        norm = LogNorm(vmin=vmin, vmax=vmax)
+    elif stretch == "sqrt":
+        norm = PowerNorm(0.5, vmin=vmin, vmax=vmax)
+    else:
+        raise RuntimeError(f"'{stretch}' is not a valid stretch!")
+    with fits.open(img_file) as f:
+        hdu = f[hdu]
+        w = wcs.WCS(hdu.header)
+        pix_scale = proj_plane_pixel_scales(w)
+        if center is None:
+            center = w.wcs.crpix
+        else:
+            center = w.wcs_world2pix(center[0], center[1], 0)
+        if width is None:
+            dx_pix = 0.5*hdu.shape[0]
+            dy_pix = 0.5*hdu.shape[1]
+        else:
+            dx_pix = width / pix_scale[0]
+            dy_pix = width / pix_scale[1]
+        fig = plt.figure(figsize=figsize)
+        ax = WCSAxes(fig, [0.15, 0.1, 0.8, 0.8], wcs=w)
+        fig.add_axes(ax)
+        im = ax.imshow(hdu.data, norm=norm, cmap=cmap)
+        ax.set_xlim(center[0] - 0.5*dx_pix, center[0] + 0.5*dx_pix)
+        ax.set_ylim(center[1] - 0.5*dy_pix, center[1] + 0.5*dy_pix)
+        ax.set_facecolor(facecolor)
+        cbar = plt.colorbar(im)
     return fig, ax

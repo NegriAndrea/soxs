@@ -3,31 +3,27 @@ language: python
 env:
     global:
         # Set defaults to avoid repeating in most cases
-        - ANSWER_VER=4
+        - ANSWER_VER=5
         - NUMPY_VERSION=1.16
 
 matrix:
     include:
 
         # Try all python versions with the latest numpy
-        - python: 3.6
-          env: CMD="py.test --cov=soxs soxs/tests --answer_dir=$PWD/soxs_test_data"; PYTHON='python3.6';
         - python: 3.7
           env: CMD="py.test --cov=soxs soxs/tests --answer_dir=$PWD/soxs_test_data"; PYTHON='python3.7';
         - python: 3.8
           env: CMD="py.test --cov=soxs soxs/tests --answer_dir=$PWD/soxs_test_data"; PYTHON='python3.8';
+        - python: 3.9
+          env: NUMPY_VERSION=1.19; CMD="py.test --cov=soxs soxs/tests --answer_dir=$PWD/soxs_test_data"; PYTHON='python3.9';
 
 before_install:
 
-    - wget http://hea-www.cfa.harvard.edu/~jzuhone/apec_v3.0.9_nei_comp.fits
-    - wget http://hea-www.cfa.harvard.edu/~jzuhone/apec_v3.0.9_nei_line.fits
-    - wget http://hea-www.cfa.harvard.edu/~jzuhone/soxs_responses.tar.gz
-    - tar -zxvf soxs_responses.tar.gz
     - wget http://hea-www.cfa.harvard.edu/~jzuhone/soxs_test_data_${ANSWER_VER}.tar.gz
     - tar -zxvf soxs_test_data_${ANSWER_VER}.tar.gz
 
     - mkdir -p $HOME/.config/soxs
-    - printf "[soxs]\nresponse_path = $PWD/soxs_responses" >> $HOME/.config/soxs/soxs.cfg
+    - printf "[soxs]\nsoxs_data_dir = $PWD/soxs_data" >> $HOME/.config/soxs/soxs.cfg
 
     # Use utf8 encoding. Should be default, but this is insurance against
     # future changes
@@ -49,8 +45,7 @@ install:
 
     # CORE DEPENDENCIES
     - conda config --add channels conda-forge
-    - conda install --yes numpy=$NUMPY_VERSION pytest pip astropy scipy cython h5py tqdm pyyaml
-    - conda install --yes -c astropy pyregion
+    - conda install --yes numpy=$NUMPY_VERSION pytest pip astropy scipy cython h5py tqdm pyyaml regions
     
     # COVERAGE DEPENDENCIES
     - pip install coverage coveralls pytest-cov

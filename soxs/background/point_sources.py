@@ -1,6 +1,6 @@
 import numpy as np
-from soxs import write_photon_list
 from soxs.constants import keV_per_erg, erg_per_keV
+from soxs.simput import SimputCatalog, SimputPhotonList
 from soxs.spectra import get_wabs_absorb, get_tbabs_absorb
 from soxs.utils import mylog, parse_prng, parse_value
 from scipy.interpolate import InterpolatedUnivariateSpline
@@ -35,6 +35,7 @@ fb_emax = 2.0  # keV, high energy bound for the logN-logS flux band
 spec_emin = 0.1  # keV, minimum energy of mock spectrum
 spec_emax = 10.0  # keV, max energy of mock spectrum
 
+
 def get_flux_scale(ind, fb_emin, fb_emax, spec_emin, spec_emax):
     f_g = np.log(spec_emax/spec_emin)*np.ones(ind.size)
     f_E = np.log(fb_emax/fb_emin)*np.ones(ind.size)
@@ -45,11 +46,11 @@ def get_flux_scale(ind, fb_emin, fb_emax, spec_emin, spec_emax):
     fscale = f_g/f_E
     return fscale
 
-def generate_fluxes(exp_time, area, fov, prng):
-    from soxs.data import cdf_fluxes, cdf_gal, cdf_agn
 
-    exp_time = parse_value(exp_time, "s")
-    area = parse_value(area, "cm**2")
+def generate_fluxes(fov, prng):
+    from soxs.data import cdf_fluxes, cdf_gal, cdf_agn
+    prng = parse_prng(prng)
+
     fov = parse_value(fov, "arcmin")
 
     logf = np.log10(cdf_fluxes)
@@ -61,16 +62,11 @@ def generate_fluxes(exp_time, area, fov, prng):
     f_gal = InterpolatedUnivariateSpline(F_gal, logf)
     f_agn = InterpolatedUnivariateSpline(F_agn, logf)
 
-    eph_mean_erg = 1.0*erg_per_keV
-
-    S_min_obs = eph_mean_erg/(exp_time*area)
-    mylog.debug("Flux of %g erg/cm^2/s gives roughly "
-                "one photon during exposure." % S_min_obs)
     fov_area = fov**2
 
     n_gal = int(n_gal*fov_area/3600.0)
     n_agn = int(n_agn*fov_area/3600.0)
-    mylog.debug("%d AGN, %d galaxies in the FOV." % (n_agn, n_gal))
+    mylog.debug(f"{n_agn} AGN, {n_gal} galaxies in the FOV.")
 
     randvec1 = prng.uniform(size=n_agn)
     agn_fluxes = 10**f_agn(randvec1)
@@ -80,22 +76,28 @@ def generate_fluxes(exp_time, area, fov, prng):
 
     return agn_fluxes, gal_fluxes
 
-def generate_sources(exp_time, fov, sky_center, area=40000.0, prng=None):
+
+def generate_positions(num, fov, sky_center, prng):
+    dec_scal = np.fabs(np.cos(sky_center[1] * np.pi / 180))
+    ra_min = sky_center[0] - fov / (2.0 * 60.0 * dec_scal)
+    dec_min = sky_center[1] - fov / (2.0 * 60.0)
+
+    ra0 = prng.uniform(size=num) * fov / (60.0 * dec_scal) + ra_min
+    dec0 = prng.uniform(size=num) * fov / 60.0 + dec_min
+
+    return ra0, dec0
+
+
+def generate_sources(fov, sky_center, prng=None):
     r"""
     Make a catalog of point sources.
 
     Parameters
     ----------
-    exp_time : float, (value, unit) tuple, or :class:`~astropy.units.Quantity`
-        The exposure time of the observation in seconds.
     fov : float, (value, unit) tuple, or :class:`~astropy.units.Quantity`
         The field of view in arcminutes.
     sky_center : array-like
         The center RA, Dec of the field of view in degrees.
-    area : float, (value, unit) tuple, or :class:`~astropy.units.Quantity`, optional
-        The effective area in cm**2. It must be large enough 
-        so that a sufficiently large sample is drawn for the 
-        ARF. Default: 40000.
     prng : :class:`~numpy.random.RandomState` object, integer, or None
         A pseudo-random number generator. Typically will only 
         be specified if you have a reason to generate the same 
@@ -104,25 +106,19 @@ def generate_sources(exp_time, fov, sky_center, area=40000.0, prng=None):
     """
     prng = parse_prng(prng)
 
-    exp_time = parse_value(exp_time, "s")
     fov = parse_value(fov, "arcmin")
-    area = parse_value(area, "cm**2")
 
-    agn_fluxes, gal_fluxes = generate_fluxes(exp_time, area, fov, prng)
+    agn_fluxes, gal_fluxes = generate_fluxes(fov, prng)
 
     fluxes = np.concatenate([agn_fluxes, gal_fluxes])
 
     ind = np.concatenate([get_agn_index(np.log10(agn_fluxes)),
                           gal_index * np.ones(gal_fluxes.size)])
 
-    dec_scal = np.fabs(np.cos(sky_center[1] * np.pi / 180))
-    ra_min = sky_center[0] - fov / (2.0 * 60.0 * dec_scal)
-    dec_min = sky_center[1] - fov / (2.0 * 60.0)
-
-    ra0 = prng.uniform(size=fluxes.size) * fov / (60.0 * dec_scal) + ra_min
-    dec0 = prng.uniform(size=fluxes.size) * fov / 60.0 + dec_min
+    ra0, dec0 = generate_positions(fluxes.size, fov, sky_center, prng)
 
     return ra0, dec0, fluxes, ind
+
 
 def make_ptsrc_background(exp_time, fov, sky_center, absorb_model="wabs", 
                           nH=0.05, area=40000.0, input_sources=None, 
@@ -168,11 +164,10 @@ def make_ptsrc_background(exp_time, fov, sky_center, absorb_model="wabs",
         nH = parse_value(nH, "1.0e22*cm**-2")
     area = parse_value(area, "cm**2")
     if input_sources is None:
-        ra0, dec0, fluxes, ind = generate_sources(exp_time, fov, sky_center,
-                                                  area=area, prng=prng)
+        ra0, dec0, fluxes, ind = generate_sources(fov, sky_center, prng=prng)
         num_sources = fluxes.size
     else:
-        mylog.info("Reading in point-source properties from %s." % input_sources)
+        mylog.info(f"Reading in point-source properties from {input_sources}.")
         t = ascii.read(input_sources)
         ra0 = t["RA"].data
         dec0 = t["Dec"].data
@@ -180,7 +175,7 @@ def make_ptsrc_background(exp_time, fov, sky_center, absorb_model="wabs",
         ind = t["index"].data
         num_sources = fluxes.size
 
-    mylog.debug("Generating spectra from %d sources." % num_sources)
+    mylog.debug(f"Generating spectra from {num_sources} sources.")
 
     # If requested, output the source properties to a file
     if output_sources is not None:
@@ -238,7 +233,7 @@ def make_ptsrc_background(exp_time, fov, sky_center, absorb_model="wabs",
 
     # Remove some of the photons due to Galactic foreground absorption.
     # We will throw a lot of stuff away, but this is more general and still
-    # faster. 
+    # faster.
     if nH is not None:
         if absorb_model == "wabs":
             absorb = get_wabs_absorb(all_energies, nH)
@@ -249,7 +244,7 @@ def make_ptsrc_background(exp_time, fov, sky_center, absorb_model="wabs",
         all_ra = all_ra[randvec < absorb]
         all_dec = all_dec[randvec < absorb]
         all_nph = all_energies.size
-    mylog.debug("%d photons remain after foreground galactic absorption." % all_nph)
+    mylog.debug(f"{all_nph} photons remain after foreground galactic absorption.")
 
     all_flux = np.sum(all_energies)*erg_per_keV/(exp_time*area)
 
@@ -258,21 +253,22 @@ def make_ptsrc_background(exp_time, fov, sky_center, absorb_model="wabs",
 
     return output_events
 
-def make_point_sources_file(simput_prefix, phlist_prefix, exp_time, fov, 
+
+def make_point_sources_file(filename, name, exp_time, fov, 
                             sky_center, absorb_model="wabs", nH=0.05, 
-                            area=40000.0, prng=None, append=False, 
-                            overwrite=False, input_sources=None, 
-                            output_sources=None):
+                            area=40000.0, prng=None, append=False,
+                            overwrite=False, src_filename=None,
+                            input_sources=None, output_sources=None):
     """
     Make a SIMPUT catalog made up of contributions from
     point sources. 
 
     Parameters
     ----------
-    simput_prefix : string
-        The filename prefix for the SIMPUT file.
-    phlist_prefix : string
-        The filename prefix for the photon list file.
+    filename : string
+        The filename for the SIMPUT catalog.
+    name : string
+        The name of the SIMPUT photon list.
     exp_time : float, (value, unit) tuple, or :class:`~astropy.units.Quantity`
         The exposure time of the observation in seconds.
     fov : float, (value, unit) tuple, or :class:`~astropy.units.Quantity`
@@ -292,12 +288,16 @@ def make_point_sources_file(simput_prefix, phlist_prefix, exp_time, fov,
         A pseudo-random number generator. Typically will only 
         be specified if you have a reason to generate the same 
         set of random numbers, such as for a test. Default is None, 
-        which sets the seed based on the system time. 
+        which sets the seed based on the system time.
     append : boolean, optional
-        If True, append a new source an existing SIMPUT 
-        catalog. Default: False
+        If True, the photon list source will be appended to an existing
+        SIMPUT catalog. Default: False
     overwrite : boolean, optional
         Set to True to overwrite previous files. Default: False
+    src_filename : string, optional
+        If set, this will be the filename to write the source
+        to. By default, the source will be written to the same
+        file as the SIMPUT catalog.
     input_sources : string, optional
         If set to a filename, input the source positions, fluxes,
         and spectral indices from an ASCII table instead of generating
@@ -310,12 +310,19 @@ def make_point_sources_file(simput_prefix, phlist_prefix, exp_time, fov,
                                    absorb_model=absorb_model, nH=nH, 
                                    area=area, input_sources=input_sources, 
                                    output_sources=output_sources, prng=prng)
-    write_photon_list(simput_prefix, phlist_prefix, events["flux"], 
-                      events["ra"], events["dec"], events["energy"], 
-                      append=append, overwrite=overwrite)
+    phlist = SimputPhotonList(events["ra"], events["dec"], events["energy"],
+                              events["flux"], name=name)
+    if append:
+        cat = SimputCatalog.from_file(filename)
+        cat.append(phlist, src_filename=src_filename, overwrite=overwrite)
+    else:
+        cat = SimputCatalog.from_source(filename, phlist, 
+                                        src_filename=src_filename, 
+                                        overwrite=overwrite)
+    return cat
 
-def make_point_source_list(output_file, exp_time, fov, sky_center,
-                           area=40000.0, prng=None):
+
+def make_point_source_list(output_file, fov, sky_center, prng=None):
     r"""
     Make a list of point source properties and write it to an ASCII
     table file.
@@ -324,24 +331,17 @@ def make_point_source_list(output_file, exp_time, fov, sky_center,
     ----------
     output_file : string
         The ASCII table file to write the source properties to.
-    exp_time : float, (value, unit) tuple, or :class:`~astropy.units.Quantity`
-        The exposure time of the observation in seconds.
     fov : float, (value, unit) tuple, or :class:`~astropy.units.Quantity`
         The field of view in arcminutes.
     sky_center : array-like
         The center RA, Dec of the field of view in degrees.
-    area : float, (value, unit) tuple, or :class:`~astropy.units.Quantity`, optional
-        The effective area in cm**2. It must be large enough 
-        so that a sufficiently large sample is drawn for the 
-        ARF. Default: 40000.
     prng : :class:`~numpy.random.RandomState` object, integer, or None
         A pseudo-random number generator. Typically will only 
         be specified if you have a reason to generate the same 
         set of random numbers, such as for a test. Default is None, 
         which sets the seed based on the system time. 
     """
-    ra0, dec0, fluxes, ind = generate_sources(exp_time, fov, sky_center,
-                                              area=area, prng=prng)
+    ra0, dec0, fluxes, ind = generate_sources(fov, sky_center, prng=prng)
 
     t = Table([ra0, dec0, fluxes, ind],
               names=('RA', 'Dec', 'flux_0.5_2.0_keV', 'index'))
