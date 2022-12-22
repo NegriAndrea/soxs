@@ -7,7 +7,7 @@ This section details the API of the various Python functions and classes in SOXS
 
 .. toctree::
     :maxdepth: 1
-        
+
     spectra
     spatial
     simput
@@ -16,3 +16,4 @@ This section details the API of the various Python functions and classes in SOXS
     events
     source_catalogs
     mosaic
+    utils

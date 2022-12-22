@@ -1,15 +1,19 @@
-import numpy as np
-
-import astropy.io.fits as pyfits
 import astropy.units as u
-import astropy.wcs as pywcs
-
+import numpy as np
+from astropy import wcs
+from astropy.io import fits
 from tqdm.auto import tqdm
 
 from soxs.constants import erg_per_keV
 from soxs.instrument_registry import instrument_registry
-from soxs.utils import get_data_file, ensure_numpy_array, image_pos, \
-    mylog, parse_prng, parse_value
+from soxs.utils import (
+    ensure_numpy_array,
+    get_data_file,
+    image_pos,
+    mylog,
+    parse_prng,
+    parse_value,
+)
 
 
 class AuxiliaryResponseFile:
@@ -25,16 +29,19 @@ class AuxiliaryResponseFile:
     --------
     >>> arf = AuxiliaryResponseFile("xrs_mucal_3x10_3.0eV.arf")
     """
+
     def __init__(self, filename):
         self.filename = get_data_file(filename)
-        f = pyfits.open(self.filename)
-        self.elo = f["SPECRESP"].data.field("ENERG_LO")
-        self.ehi = f["SPECRESP"].data.field("ENERG_HI")
-        self.emid = 0.5*(self.elo+self.ehi)
-        self.eff_area = np.nan_to_num(
-            f["SPECRESP"].data.field("SPECRESP")).astype("float64")
-        self.max_area = self.eff_area.max()
-        f.close()
+        with fits.open(self.filename) as f:
+            self.elo = f["SPECRESP"].data.field("ENERG_LO")
+            self.ehi = f["SPECRESP"].data.field("ENERG_HI")
+            self.ebins = np.append(self.elo, self.ehi[-1])
+            self.de = np.diff(self.ebins)
+            self.emid = 0.5 * (self.elo + self.ehi)
+            self.eff_area = np.nan_to_num(f["SPECRESP"].data.field("SPECRESP")).astype(
+                "float64"
+            )
+            self.max_area = self.eff_area.max()
 
     @classmethod
     def from_instrument(cls, name):
@@ -46,7 +53,7 @@ class AuxiliaryResponseFile:
         Parameters
         ----------
         name : string
-            The name of the instrument specification to use 
+            The name of the instrument specification to use
             to obtain the ARF object from.
 
         Examples
@@ -63,52 +70,61 @@ class AuxiliaryResponseFile:
 
     def interpolate_area(self, energy):
         """
-        Interpolate the effective area to the energies 
+        Interpolate the effective area to the energies
         provided  by the supplied *energy* array.
         """
-        earea = np.interp(np.asarray(energy), self.emid, self.eff_area,
-                          left=0.0, right=0.0)
+        earea = np.interp(
+            np.asarray(energy), self.emid, self.eff_area, left=0.0, right=0.0
+        )
         return u.Quantity(earea, "cm**2")
 
     def detect_events_spec(self, src, exp_time, refband, prng=None):
-        from soxs.spectra import ConvolvedSpectrum
         prng = parse_prng(prng)
-        cspec = ConvolvedSpectrum.convolve(
-            src.spec, self).new_spec_from_band(refband[0], refband[1])
-        energy = cspec.generate_energies(exp_time, quiet=True, prng=prng).value
+        f, _ = np.histogram(src.energy, self.ebins, weights=src.fluxdensity)
+        f *= self.de
+        N = np.cumsum(f * self.eff_area)
+        idxs = np.logical_and(self.elo >= refband[0], self.ehi <= refband[1])
+        ref_flux = (self.emid * erg_per_keV * f)[idxs].sum()
+        rate = src.flux * N[-1] / ref_flux
+        n_ph = prng.poisson(lam=rate * exp_time)
+        randvec = prng.uniform(size=n_ph)
+        randvec.sort()
+        cumspec = np.insert(N, 0, 0.0)
+        cumspec /= cumspec[-1]
+        energy = np.interp(randvec, cumspec, self.ebins)
         if getattr(src, "imhdu", None):
             x, y = image_pos(src.imhdu.data, energy.size, prng)
-            w = pywcs.WCS(header=src.imhdu.header)
+            w = wcs.WCS(header=src.imhdu.header)
             w.wcs.crval = [src.ra, src.dec]
             ra, dec = w.wcs_pix2world(x, y, 1)
         else:
             pones = np.ones_like(energy)
-            ra = src.ra*pones
-            dec = src.dec*pones
-        mylog.info(f"{energy.size} events detected.")
+            ra = src.ra * pones
+            dec = src.dec * pones
+        mylog.debug("%d events detected from this spectrum.", energy.size)
         return {"energy": energy, "ra": ra, "dec": dec}
 
     def detect_events_phlist(self, events, exp_time, flux, refband, prng=None):
         """
-        Use the ARF to determine a subset of photons which 
+        Use the ARF to determine a subset of photons which
         will be detected.
 
         Parameters
         ----------
         events : dict of np.ndarrays
-            The energies and positions of the photons. 
+            The energies and positions of the photons.
         exp_time : float
             The exposure time in seconds.
         flux : float
-            The total flux of the photons in erg/s/cm^2. 
+            The total flux of the photons in erg/s/cm^2.
         refband : array_like
-            A two-element array or list containing the limits 
-            of the energy band which the flux was computed in. 
+            A two-element array or list containing the limits
+            of the energy band which the flux was computed in.
         prng : :class:`~numpy.random.RandomState` object, integer, or None
-            A pseudo-random number generator. Typically will only 
-            be specified if you have a reason to generate the same 
-            set of random numbers, such as for a test. Default is None, 
-            which sets the seed based on the system time. 
+            A pseudo-random number generator. Typically will only
+            be specified if you have a reason to generate the same
+            set of random numbers, such as for a test. Default is None,
+            which sets the seed based on the system time.
         """
         prng = parse_prng(prng)
         energy = np.asarray(events["energy"])
@@ -116,25 +132,38 @@ class AuxiliaryResponseFile:
             return events
         earea = self.interpolate_area(energy).value
         idxs = np.logical_and(energy >= refband[0], energy <= refband[1])
-        rate = flux/(energy[idxs].sum()*erg_per_keV)*earea[idxs].sum()
-        n_ph = prng.poisson(lam=rate*exp_time)
-        fak = float(n_ph)/energy.size
+        rate = flux / (energy[idxs].sum() * erg_per_keV) * earea[idxs].sum()
+        n_ph = prng.poisson(lam=rate * exp_time)
+        fak = float(n_ph) / energy.size
         if fak > 1.0:
-            mylog.error(f"Number of events in sample: {energy.size}, "
-                        f"Number of events wanted: {n_ph}")
-            raise ValueError("This combination of exposure time and effective "
-                             "area will result in more photons being drawn "
-                             "than are available in the sample!!!")
+            mylog.error(
+                "Number of events in sample: %d, Number of events " "wanted: %d",
+                n_ph,
+                energy.size,
+            )
+            raise ValueError(
+                "This combination of exposure time and effective "
+                "area will result in more photons being drawn "
+                "than are available in the sample!!!"
+            )
         w = earea / self.max_area
         randvec = prng.uniform(size=energy.size)
         eidxs = prng.permutation(np.where(randvec < w)[0])[:n_ph].astype("int64")
-        mylog.info(f"{n_ph} events detected.")
+        mylog.debug("%d events detected out of %d.", n_ph, energy.size)
         for key in events:
             events[key] = np.asarray(events[key][eidxs])
         return events
 
-    def plot(self, xscale="log", yscale="log", xlabel=None,
-             ylabel=None, fig=None, ax=None, **kwargs):
+    def plot(
+        self,
+        xscale="log",
+        yscale="log",
+        xlabel=None,
+        ylabel=None,
+        fig=None,
+        ax=None,
+        **kwargs,
+    ):
         """
         Make a quick plot of the effective area curve.
 
@@ -149,22 +178,23 @@ class AuxiliaryResponseFile:
         ylabel : string
             The label of the y-axis. Default: "$\\mathrm{A\\ (cm^2)}$"
         fig : :class:`~matplotlib.figure.Figure`, optional
-            The figure to place the plot in. If not supplied, 
+            The figure to place the plot in. If not supplied,
             one will be created.
         ax : :class:`~matplotlib.axes.Axes`, optional
-            The axes to place the plot in. If not supplied, 
+            The axes to place the plot in. If not supplied,
             one will be created.
 
-        All other arguments are passed to the call to 
+        All other arguments are passed to the call to
         :meth:`~matplotlib.axes.Axes.plot`.
 
         Returns
         -------
 
-        A tuple of the :class:`~matplotlib.figure.Figure` and 
+        A tuple of the :class:`~matplotlib.figure.Figure` and
         :class:`~matplotlib.axes.Axes` objects.
         """
         import matplotlib.pyplot as plt
+
         if xlabel is None:
             xlabel = "E (keV)"
         if ylabel is None:
@@ -190,23 +220,24 @@ class FlatResponse(AuxiliaryResponseFile):
     emin : float
         The minimum energy of the response in keV.
     emax : float
-        The maximum energy of the response in keV. 
+        The maximum energy of the response in keV.
     area : float
-        The effective area in cm**2. 
+        The effective area in cm**2.
     nbins : integer
-        The number of bins in the response file. 
+        The number of bins in the response file.
 
     Examples
     --------
     >>> arf = FlatResponse(0.1, 10.0, 3000.0, 10000)
     """
+
     def __init__(self, emin, emax, area, nbins):
         self.filename = "flat_response"
-        de = (emax-emin)/nbins
-        self.elo = np.arange(nbins)*de + emin
+        de = (emax - emin) / nbins
+        self.elo = np.arange(nbins) * de + emin
         self.ehi = self.elo + de
-        self.emid = 0.5*(self.elo+self.ehi)
-        self.eff_area = area*np.ones(nbins)
+        self.emid = 0.5 * (self.elo + self.ehi)
+        self.eff_area = area * np.ones(nbins)
         self.max_area = area
 
 
@@ -223,17 +254,20 @@ class RedistributionMatrixFile:
     --------
     >>> rmf = RedistributionMatrixFile("xrs_hdxi.rmf")
     """
+
     def __init__(self, filename):
         self.filename = get_data_file(filename)
-        self.handle = pyfits.open(self.filename, memmap=True)
+        self.handle = fits.open(self.filename, memmap=True)
         if "MATRIX" in self.handle:
             self.mat_key = "MATRIX"
         elif "SPECRESP MATRIX" in self.handle:
             self.mat_key = "SPECRESP MATRIX"
         else:
-            raise RuntimeError(f"Cannot find the response matrix in the RMF "
-                               f"file {filename}! It should be named "
-                               f"\"MATRIX\" or \"SPECRESP MATRIX\".")
+            raise RuntimeError(
+                f"Cannot find the response matrix in the RMF "
+                f"file {filename}! It should be named "
+                f'"MATRIX" or "SPECRESP MATRIX".'
+            )
         self.header = self.handle[self.mat_key].header
         self.num_mat_columns = len(self.handle[self.mat_key].columns)
         self.ebounds_header = self.handle["EBOUNDS"].header
@@ -241,12 +275,12 @@ class RedistributionMatrixFile:
         self.elo = self.data["ENERG_LO"]
         self.ehi = self.data["ENERG_HI"]
         self.ebins = np.append(self.data["ENERG_LO"], self.data["ENERG_HI"][-1])
-        self.emid = 0.5*(self.elo+self.ehi)
-        self.de = self.ehi-self.elo
+        self.emid = 0.5 * (self.elo + self.ehi)
+        self.de = self.ehi - self.elo
         self.n_e = self.elo.size
         self.n_ch = self.header["DETCHANS"]
         num = 0
-        for i in range(1, self.num_mat_columns+1):
+        for i in range(1, self.num_mat_columns + 1):
             if self.header[f"TTYPE{i}"] == "F_CHAN":
                 num = i
                 break
@@ -263,7 +297,7 @@ class RedistributionMatrixFile:
         Parameters
         ----------
         name : string
-            The name of the instrument specification to use 
+            The name of the instrument specification to use
             to obtain the RMF object from.
 
         Examples
@@ -277,7 +311,7 @@ class RedistributionMatrixFile:
 
     @property
     def chan_type(self):
-        return self.header["CHANTYPE"].lower()
+        return self.header["CHANTYPE"].upper()
 
     @property
     def data(self):
@@ -305,31 +339,31 @@ class RedistributionMatrixFile:
 
     def eb_to_ch(self, energy):
         energy = parse_value(energy, "keV")
-        return np.searchsorted(self.ebounds_data["E_MIN"], energy)-1
+        return np.searchsorted(self.ebounds_data["E_MIN"], energy) - 1
 
     def ch_to_eb(self, channels, prng=None):
         prng = parse_prng(prng)
         emin = self.ebounds_data["E_MIN"]
         emax = self.ebounds_data["E_MAX"]
-        de = emax-emin
+        de = emax - emin
         ch = channels - self.cmin
-        e = emin[ch] + prng.uniform(size=channels.size)*de[ch]
+        e = emin[ch] + prng.uniform(size=channels.size) * de[ch]
         return e
 
     def scatter_energies(self, events, prng=None):
         """
-        Scatter photon energies with the RMF and produce the 
+        Scatter photon energies with the RMF and produce the
         corresponding channel values.
 
         Parameters
         ----------
         events : dict of np.ndarrays
-            The energies and positions of the photons. 
+            The energies and positions of the photons.
         prng : :class:`~numpy.random.RandomState` object, integer, or None
-            A pseudo-random number generator. Typically will only 
-            be specified if you have a reason to generate the same 
-            set of random numbers, such as for a test. Default is None, 
-            which sets the seed based on the system time. 
+            A pseudo-random number generator. Typically will only
+            be specified if you have a reason to generate the same
+            set of random numbers, such as for a test. Default is None,
+            which sets the seed based on the system time.
         """
         prng = parse_prng(prng)
         eidxs = np.argsort(events["energy"])
@@ -370,37 +404,46 @@ class RedistributionMatrixFile:
 
         return events
 
-    def convolve_spectrum(self, cspec, exp_time, noisy=True, prng=None):
+    def convolve_spectrum(self, cspec, exp_time, noisy=True, prng=None, rate=False):
         prng = parse_prng(prng)
         exp_time = parse_value(exp_time, "s")
         counts = cspec.flux.value * exp_time * cspec.de.value
-        spec = np.histogram(cspec.emid.value, self.ebins, weights=counts)[0]
+        if (
+            len(cspec.emid) == self.n_e
+            and np.isclose(cspec.ebins.value, self.ebins).all()
+        ):
+            spec = counts
+        else:
+            spec = np.histogram(cspec.emid.value, self.ebins, weights=counts)[0]
         conv_spec = np.zeros(self.n_ch)
         pbar = tqdm(leave=True, total=self.n_e, desc="Convolving spectrum ")
-        if not isinstance(self.data["MATRIX"], pyfits.column._VLF) and \
-                np.all(self.data["N_GRP"] == 1):
+        if not isinstance(self.data["MATRIX"], fits.column._VLF) and np.all(
+            self.data["N_GRP"] == 1
+        ):
             # We can do things a bit faster if there is only one group each
             f_chan = ensure_numpy_array(np.nan_to_num(self.data["F_CHAN"]))
             n_chan = ensure_numpy_array(np.nan_to_num(self.data["N_CHAN"]))
             mat = np.nan_to_num(np.float64(self.data["MATRIX"]))
-            mat_size = np.minimum(n_chan, self.n_ch-f_chan)
+            mat_size = np.minimum(n_chan, self.n_ch - f_chan)
             for k in range(self.n_e):
-                conv_spec[f_chan[k]:f_chan[k]+n_chan[k]] += spec[k]*mat[k,:mat_size[k]]
+                conv_spec[f_chan[k] : f_chan[k] + n_chan[k]] += (
+                    spec[k] * mat[k, : mat_size[k]]
+                )
                 pbar.update()
         else:
             # Otherwise, we have to go step-by-step
             for k in range(self.n_e):
-                f_chan = ensure_numpy_array(
-                    np.nan_to_num(self.data["F_CHAN"][k]))
-                n_chan = ensure_numpy_array(
-                    np.nan_to_num(self.data["N_CHAN"][k]))
+                f_chan = ensure_numpy_array(np.nan_to_num(self.data["F_CHAN"][k]))
+                n_chan = ensure_numpy_array(np.nan_to_num(self.data["N_CHAN"][k]))
                 mat = np.nan_to_num(np.float64(self.data["MATRIX"][k]))
-                mat_size = np.minimum(n_chan, self.n_ch-f_chan)
+                mat_size = np.minimum(n_chan, self.n_ch - f_chan)
                 for i, f in enumerate(f_chan):
-                    conv_spec[f:f+n_chan[i]] += spec[k]*mat[:mat_size[i]]
+                    if n_chan[i] != 0:
+                        conv_spec[f : f + n_chan[i]] += spec[k] * mat[: mat_size[i]]
                 pbar.update()
         pbar.close()
         if noisy:
-            return prng.poisson(lam=conv_spec)
-        else:
-            return conv_spec
+            conv_spec = prng.poisson(lam=conv_spec)
+        if rate:
+            conv_spec /= exp_time
+        return conv_spec

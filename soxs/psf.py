@@ -1,10 +1,16 @@
 import numpy as np
-import astropy.io.fits as pyfits
+from astropy.io import fits
 from astropy.units import Quantity
 
 from soxs.constants import sigma_to_fwhm
-from soxs.utils import parse_prng, get_data_file, \
-    image_pos, find_nearest
+from soxs.utils import get_data_file, image_pos, parse_prng
+
+
+def score_psf(img_bins, e, r):
+    de = np.abs(img_bins[0][:, np.newaxis] - e)
+    dr = np.abs(img_bins[1][:, np.newaxis] - r)
+    score = 100 * de + dr
+    return score
 
 
 psf_model_registry = {}
@@ -33,7 +39,7 @@ class GaussianPSF(PSF):
     def __init__(self, inst, prng=None):
         super().__init__(prng)
         fwhm = inst["psf"][1]
-        plate_scale_arcsec = inst['fov']/inst['num_pixels']*60.0
+        plate_scale_arcsec = inst["fov"] / inst["num_pixels"] * 60.0
         self.sigma = fwhm / sigma_to_fwhm / plate_scale_arcsec
 
     def scatter(self, x, y, e):
@@ -43,23 +49,110 @@ class GaussianPSF(PSF):
         return x, y
 
 
+class EEFPSF(PSF):
+    _psf_type = "eef"
+
+    def __init__(self, inst, prng=None):
+        super().__init__(prng)
+        img_file = get_data_file(inst["psf"][1])
+        hdu = inst["psf"][2]
+        plate_scale_arcsec = inst["fov"] / inst["num_pixels"] * 60.0
+        self.eefhdu = fits.open(get_data_file(img_file))[hdu]
+        unit = getattr(self.eefhdu.columns["psfrad"], "unit", "arcsec")
+        self.scale = Quantity(1.0, unit).to_value("arcsec") / plate_scale_arcsec
+
+    def scatter(self, x, y, e):
+        n_evt = x.size
+        # This returns image coordinates from the PSF
+        # image
+        rad = self.eefhdu.data["psfrad"] * self.scale
+        cdf = self.eefhdu.data["eef"]
+        randvec = self.prng.uniform(low=cdf[0], high=cdf[-1], size=n_evt)
+        r = np.interp(randvec, cdf, rad)
+        phi = self.prng.uniform(low=0.0, high=2.0 * np.pi, size=n_evt)
+        return x + r * np.cos(phi), y + r * np.sin(phi)
+
+
+class MultiEEFPSF(PSF):
+    _psf_type = "multi_eef"
+
+    def __init__(self, inst, prng=None):
+        super().__init__(prng)
+        self.eef_file = get_data_file(inst["psf"][1])
+        plate_scale_arcmin = inst["fov"] / inst["num_pixels"]
+        plate_scale_arcsec = plate_scale_arcmin * 60.0
+        eef_e = []
+        eef_r = []
+        eef_i = []
+        eef_u = []
+        with fits.open(self.eef_file, lazy_load_hdus=True) as f:
+            for i, hdu in enumerate(f):
+                if hdu.header["XTENSION"] != "BINTABLE":
+                    continue
+                eef_e.append(hdu.header["ENERGY"])
+                key = "THETA" if "OFFAXIS" not in hdu.header else "OFFAXIS"
+                eef_r.append(hdu.header[key])
+                eef_i.append(i)
+                eef_u.append(getattr(hdu.columns["psfrad"], "unit", "arcsec"))
+        eef_e = np.array(eef_e)
+        eef_r = (np.array(eef_r) / plate_scale_arcmin) ** 2
+        if np.all(eef_e > 100.0):
+            # this is probably in eV
+            eef_e *= 1.0e-3
+        self.eef_bins = np.array([eef_e, eef_r])
+        self.eef_i = eef_i
+        self.num_eef = len(eef_e)
+        unit = list(set(eef_u))
+        if len(unit) > 1:
+            raise RuntimeError("More than one psfrad unit detected!!")
+        self.eef_s = Quantity(1.0, unit[0]).to_value("arcsec") / plate_scale_arcsec
+
+    def scatter(self, x, y, e):
+        r2 = (x - self.det_ctr[0]) ** 2 + (y - self.det_ctr[1]) ** 2
+        score = score_psf(self.img_bins, e, r2)
+        idx_score = np.argmin(score, axis=0)
+        n_in = x.size
+        n_out = 0
+        with fits.open(self.eef_file) as f:
+            for j in range(self.num_eef):
+                # This returns image coordinates from the EEF
+                # curve
+                idxs = np.where(idx_score == j)[0]
+                n_out += idxs.size
+                rad = f[self.eef_i[j]].data["psfrad"] * self.eef_s[j]
+                cdf = f[self.eef_i[j]].data["eef"]
+                randvec = self.prng.uniform(low=cdf[0], high=cdf[-1], size=idxs.size)
+                r = np.interp(randvec, cdf, rad)
+                phi = self.prng.uniform(low=0.0, high=2.0 * np.pi, size=idxs.size)
+                x[idxs] += r * np.cos(phi)
+                y[idxs] += r * np.sin(phi)
+            if n_in != n_out:
+                raise ValueError(
+                    f"The number of photons scattered by the PSF "
+                    f"({n_out}) does not equal the input number "
+                    f"({n_in})!"
+                )
+        return x, y
+
+
 class ImagePSF(PSF):
     _psf_type = "image"
 
     def __init__(self, inst, prng=None):
         super().__init__(prng)
-        img_file = get_data_file(inst['psf'][1])
-        hdu = inst['psf'][2]
-        plate_scale_arcmin = inst['fov']/inst['num_pixels']
-        plate_scale_deg = plate_scale_arcmin/60.0
-        plate_scale_mm = inst['focal_length']*1e3*np.deg2rad(plate_scale_deg)
-        self.imhdu = pyfits.open(get_data_file(img_file))[hdu]
-        self.imctr = np.array([self.imhdu.header["CRPIX1"],
-                               self.imhdu.header["CRPIX2"]])
+        img_file = get_data_file(inst["psf"][1])
+        hdu = inst["psf"][2]
+        plate_scale_arcmin = inst["fov"] / inst["num_pixels"]
+        plate_scale_deg = plate_scale_arcmin / 60.0
+        plate_scale_mm = inst["focal_length"] * 1e3 * np.deg2rad(plate_scale_deg)
+        self.imhdu = fits.open(get_data_file(img_file))[hdu]
+        self.imctr = np.array(
+            [self.imhdu.header["CRPIX1"], self.imhdu.header["CRPIX2"]]
+        )
         unit = self.imhdu.header.get("CUNIT1", "mm")
-        self.scale = Quantity([self.imhdu.header["CDELT1"],
-                               self.imhdu.header["CDELT2"]],
-                              unit).to_value('mm')
+        self.scale = Quantity(
+            [self.imhdu.header["CDELT1"], self.imhdu.header["CDELT2"]], unit
+        ).to_value("mm")
         self.scale /= plate_scale_mm
 
     def scatter(self, x, y, e):
@@ -71,7 +164,7 @@ class ImagePSF(PSF):
         dy -= self.imctr[1]
         dx *= self.scale[0]
         dy *= self.scale[1]
-        return x+dx, y+dy
+        return x + dx, y + dy
 
 
 class MultiImagePSF(PSF):
@@ -79,20 +172,20 @@ class MultiImagePSF(PSF):
 
     def __init__(self, inst, prng=None):
         super().__init__(prng)
-        self.img_file = get_data_file(inst['psf'][1])
-        self.det_ctr = np.array(inst['aimpt_coords'])
-        plate_scale_arcmin = inst['fov']/inst['num_pixels']
-        plate_scale_deg = plate_scale_arcmin/60.0
-        plate_scale_mm = inst['focal_length']*1e3*np.deg2rad(plate_scale_deg)
+        self.img_file = get_data_file(inst["psf"][1])
+        self.det_ctr = np.array(inst["aimpt_coords"])
+        plate_scale_arcmin = inst["fov"] / inst["num_pixels"]
+        plate_scale_deg = plate_scale_arcmin / 60.0
+        plate_scale_mm = inst["focal_length"] * 1e3 * np.deg2rad(plate_scale_deg)
         img_e = []
         img_r = []
         img_i = []
         img_c = []
         img_s = []
         img_u = []
-        with pyfits.open(self.img_file, lazy_load_hdus=True) as f:
+        with fits.open(self.img_file, lazy_load_hdus=True) as f:
             for i, hdu in enumerate(f):
-                if not hdu.is_image:
+                if not hdu.is_image or hdu.header["NAXIS"] != 2:
                     continue
                 img_e.append(hdu.header["ENERGY"])
                 key = "THETA" if "OFFAXIS" not in hdu.header else "OFFAXIS"
@@ -101,34 +194,33 @@ class MultiImagePSF(PSF):
                 img_s.append([hdu.header["CDELT1"], hdu.header["CDELT2"]])
                 img_i.append(i)
                 img_u.append(hdu.header.get("CUNIT1", "mm"))
-        self.img_e, ie = np.unique(img_e, return_inverse=True)
-        if np.all(self.img_e > 100.0):
+        img_e = np.array(img_e)
+        img_r = (np.array(img_r) / plate_scale_arcmin) ** 2
+        if np.all(img_e > 100.0):
             # this is probably in eV
-            self.img_e *= 1.0e-3
-        self.img_r2, ir = np.unique(img_r, return_inverse=True)
-        self.img_i = {j: (i, ie[j], ir[j]) for j, i in enumerate(img_i)}
+            img_e *= 1.0e-3
+        self.img_bins = np.array([img_e, img_r])
+        self.img_i = img_i
         self.num_images = len(img_e)
-        self.img_r2 = (self.img_r2/plate_scale_arcmin)**2
         self.img_c = np.array(img_c)
         unit = list(set(img_u))
         if len(unit) > 1:
             raise RuntimeError("More than one delta unit detected!!")
-        self.img_s = Quantity(img_s, unit[0]).to_value('mm')/plate_scale_mm
+        self.img_s = Quantity(img_s, unit[0]).to_value("mm") / plate_scale_mm
 
     def scatter(self, x, y, e):
-        r2 = (x-self.det_ctr[0])**2 + (y-self.det_ctr[1])**2
-        idx_e = find_nearest(self.img_e, e)
-        idx_r = find_nearest(self.img_r2, r2)
+        r2 = (x - self.det_ctr[0]) ** 2 + (y - self.det_ctr[1]) ** 2
+        score = score_psf(self.img_bins, e, r2)
+        idx_score = np.argmin(score, axis=0)
         n_in = x.size
         n_out = 0
-        with pyfits.open(self.img_file) as f:
+        with fits.open(self.img_file) as f:
             for j in range(self.num_images):
-                i, ie, ir = self.img_i[j]
                 # This returns image coordinates from the PSF
                 # image
-                idxs = np.where((idx_e == ie) & (idx_r == ir))[0]
+                idxs = np.where(idx_score == j)[0]
                 n_out += idxs.size
-                dx, dy = image_pos(f[i].data, idxs.size, self.prng)
+                dx, dy = image_pos(f[self.img_i[j]].data, idxs.size, self.prng)
                 dx -= self.img_c[j][0]
                 dy -= self.img_c[j][1]
                 dx *= self.img_s[j][0]
@@ -136,7 +228,9 @@ class MultiImagePSF(PSF):
                 x[idxs] += dx
                 y[idxs] += dy
         if n_in != n_out:
-            raise ValueError(f"The number of photons scattered by the PSF "
-                             f"({n_out}) does not equal the input number "
-                             f"({n_in})!")
+            raise ValueError(
+                f"The number of photons scattered by the PSF "
+                f"({n_out}) does not equal the input number "
+                f"({n_in})!"
+            )
         return x, y

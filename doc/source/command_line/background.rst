@@ -3,14 +3,14 @@
 Command Line Scripts for Generating Backgrounds
 ===============================================
 
-These command line scripts allow one to generate background event files. 
+These command line scripts allow one to generate background event files.
 
 ``make_background_file``
 ------------------------
 
 The ``make_background_file`` generates a simulated observation of background
-in a standard event file format which can then be used as the background for 
-and observation or processed by standard tools such as CIAO, HEATOOLS, XSPEC, 
+in a standard event file format which can then be used as the background for
+and observation or processed by standard tools such as CIAO, HEATOOLS, XSPEC,
 etc.
 
 .. code-block:: text
@@ -18,15 +18,14 @@ etc.
     usage: make_background_file [-h] [--overwrite] [--dither_shape DITHER_SHAPE]
                                 [--dither_size DITHER_SIZE]
                                 [--input_sources INPUT_SOURCES] [--subpixel_res]
-                                [--absorb_model ABSORB_MODEL] [--nh NH]
                                 [--random_seed RANDOM_SEED]
                                 [--ptsrc_bkgnd | --no_ptsrc_bkgnd]
                                 [--instr_bkgnd | --no_instr_bkgnd]
                                 [--foreground | --no_foreground]
                                 out_file exp_time instrument sky_center
-    
+
     Run the instrument simulator and produce a simulated background event file.
-    
+
     positional arguments:
       out_file              The name of the event file to be written.
       exp_time              The exposure time to use, in seconds.
@@ -35,7 +34,7 @@ etc.
                             specification.
       sky_center            The center RA, Dec coordinates of the observation, in
                             degrees, comma-separated
-    
+
     optional arguments:
       -h, --help            show this help message and exit
       --overwrite           Overwrite an existing file with the same name.
@@ -51,11 +50,6 @@ etc.
                             x_amp,y_amp,x_period,y_period. The first two numbers
                             are in arcseconds and the second are in seconds.
                             Default: 8.0,8.0,1000.0,707.0
-      --absorb_model ABSORB_MODEL
-                            The absorption model to use for foreground galactic
-                            absorption. Default: 'wabs'
-      --nh NH               The galactic hydrogen column in units of 10**22
-                            atoms/cm**2. Default: 0.05
       --random_seed RANDOM_SEED
                             A constant integer random seed to produce a consistent
                             set of random numbers.
@@ -131,19 +125,11 @@ Turn off the point-source background:
 
     [~]$ make_background_file bkg_evt.fits 50.0,ks hdxi 30.,45. --no_ptsrc_bkgnd --overwrite
 
-Any combination of these may be used to turn multiple components off or all 
-of them. 
+Any combination of these may be used to turn multiple components off or all
+of them.
 
 Use a pre-made ASCII table of point-source properties to generate the point-source background:
 
 .. code-block:: bash
 
     [~]$ make_background_file bkg_evt.fits 50.0,ks hdxi 30.,45. --input_sources=my_ptsrc.dat --overwrite
-
-Change the foreground galactic absorption for the point-source background, and set the
-absorption model to "tbabs":
-
-.. code-block:: bash
-
-    [~]$ make_background_file bkg_evt.fits 50.0,ks hdxi 30.,45. --absorb_model="tbabs" --nh=0.02 --overwrite
-
